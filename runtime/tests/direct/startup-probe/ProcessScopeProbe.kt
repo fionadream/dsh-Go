@@ -5,6 +5,7 @@ import android.os.Process as AndroidProcess
 import android.system.Os
 import java.io.File
 import java.nio.file.Files
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -37,12 +38,16 @@ fun main(args: Array<String>) {
     val methods = mutableListOf<Boolean>()
     fun launch(directory: File): Boolean {
         val done = CountDownLatch(1)
+        val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
         val process = DshProcess(Context(directory), RuntimeManifest(launchArgv = listOf(
             File(directory, "fixture-launcher").path, "/usr/bin/env", "-i", "{GUEST_ENV}", "startup-probe-command",
         )), directory, object : DshProcess.Listener {
             override fun onLog(line: String, stream: String, storageLine: String) { println("[$case] $line") }
             override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
-            override fun onStartupFailure(source: DshProcess) {}
+            override fun onStartupFailure(source: DshProcess) {
+                startupFailures += source
+                done.countDown()
+            }
             override fun onExit(source: DshProcess, code: Int, expected: Boolean) { done.countDown() }
         })
         attempts += process
@@ -57,6 +62,8 @@ fun main(args: Array<String>) {
             check(done.await(12, TimeUnit.SECONDS)) { "Fixture launcher did not exit" }
             process.awaitExit(1000)
         }
+        val expectedFailures = if (failure == null) emptyList() else listOf(process)
+        check(startupFailures == expectedFailures) { "Unexpected startup-failure callbacks for $case" }
         return (failure == null).also(decisions::add)
     }
     try {

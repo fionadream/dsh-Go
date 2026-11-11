@@ -41,6 +41,7 @@ fun main(args: Array<String>) {
     val logs = Collections.synchronizedList(mutableListOf<String>())
     val methods = mutableListOf<Boolean>()
     val exits = Collections.synchronizedList(mutableListOf<Int>())
+    val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
     val done = CountDownLatch(1)
     val child = ProcessBuilder("/bin/sleep", "45").directory(if (owned) root else other).apply {
         if (owned) environment()["DSH_GO_RUNTIME_ROOT"] = root.canonicalPath
@@ -58,7 +59,10 @@ fun main(args: Array<String>) {
     )), root, object : DshProcess.Listener {
         override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
-        override fun onStartupFailure(source: DshProcess) {}
+        override fun onStartupFailure(source: DshProcess) {
+            startupFailures += source
+            done.countDown()
+        }
         override fun onExit(source: DshProcess, code: Int, expected: Boolean) { exits += code; done.countDown() }
     })
     try {
@@ -73,6 +77,7 @@ fun main(args: Array<String>) {
         val cleanup = runtime.killStrays()
         val errors = mutableListOf<String>()
         fun expect(value: Boolean, message: String) { if (!value) errors += message }
+        expect(startupFailures.isEmpty(), "Unexpected startup-failure callback")
         expect(runtime.executionMode == null, "an exited or rejected launch reported a current process")
         expect(runtime.launchDiagnostics.spawned == (failure == null), "spawn fact did not match the actual fixture child")
         expect(runtime.launchDiagnostics.selectedMode == if (case == "direct-unknown") "direct" else "proot", "selected method mismatch")

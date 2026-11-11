@@ -46,17 +46,24 @@ fun main(args: Array<String>) {
         check(setExecutable(true, true))
     }
     val logs = Collections.synchronizedList(mutableListOf<String>())
+    val exits = Collections.synchronizedList(mutableListOf<Int>())
+    val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
     val done = CountDownLatch(1)
     val runtime = DshProcess(context, RuntimeManifest(launchArgv = listOf(launcher.path)), root, object : DshProcess.Listener {
         override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
-        override fun onStartupFailure(source: DshProcess) {}
-        override fun onExit(source: DshProcess, code: Int, expected: Boolean) { check(code == 0); done.countDown() }
+        override fun onStartupFailure(source: DshProcess) {
+            startupFailures += source
+            done.countDown()
+        }
+        override fun onExit(source: DshProcess, code: Int, expected: Boolean) { exits += code; done.countDown() }
     })
     try {
         runtime.start(emptyMap())
         check(done.await(12, TimeUnit.SECONDS)) { "fixture did not exit" }
         runtime.awaitExit(1000)
+        check(startupFailures.isEmpty()) { "Temporary-cleanup fixture reported a startup failure" }
+        check(exits == listOf(0)) { "Temporary-cleanup fixture did not exit successfully: $exits" }
         val shouldReclaim = case == "stale"
         check(Files.exists(stale.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) != shouldReclaim) { "incorrect stale-directory outcome for $case" }
         check(live.isDirectory && child.isAlive) { "a live instance's directory or process was removed" }

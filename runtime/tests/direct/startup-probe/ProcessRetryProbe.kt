@@ -35,24 +35,29 @@ fun main(args: Array<String>) {
     } else Os.denyStatPids += pid
     data class Attempt(val process: DshProcess, val logs: MutableList<String>,
                        val methods: MutableList<Boolean>, val exits: MutableList<Int>,
+                       val startupFailures: MutableList<DshProcess>,
                        val done: CountDownLatch)
     fun newAttempt(): Attempt {
         val logs = Collections.synchronizedList(mutableListOf<String>())
         val methods = Collections.synchronizedList(mutableListOf<Boolean>())
         val exits = Collections.synchronizedList(mutableListOf<Int>())
+        val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
         val done = CountDownLatch(1)
         val process = DshProcess(Context(root), RuntimeManifest(launchArgv = listOf(
             launcher.path, "/usr/bin/env", "-i", "{GUEST_ENV}", "startup-probe-command",
         )), root, object : DshProcess.Listener {
             override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
             override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
-            override fun onStartupFailure(source: DshProcess) {}
+            override fun onStartupFailure(source: DshProcess) {
+                startupFailures += source
+                done.countDown()
+            }
             override fun onExit(source: DshProcess, code: Int, expected: Boolean) {
                 exits += code
                 done.countDown()
             }
         })
-        return Attempt(process, logs, methods, exits, done)
+        return Attempt(process, logs, methods, exits, startupFailures, done)
     }
     val attempts = mutableListOf<Attempt>()
     fun launch(attempt: Attempt): Throwable? {
@@ -94,6 +99,9 @@ fun main(args: Array<String>) {
         val secondCleanup = second.process.killStrays()
         val errors = mutableListOf<String>()
         fun expect(value: Boolean, message: String) { if (!value) errors += message }
+        val expectedFirstFailures = if (firstFailure == null) emptyList() else listOf(first.process)
+        expect(first.startupFailures == expectedFirstFailures, "Unexpected first startup-failure callbacks")
+        expect(second.startupFailures.isEmpty(), "Unexpected second startup-failure callback")
         expect(sameIdentityBeforeRetry && sameIdentityAfterRetry, "Fixture process identity changed")
         expect(!firstCleanup && !secondCleanup, "Observation failure was misreported as cleanup success")
         if (captured) {
