@@ -4,4 +4,16 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- DUMP is held by adb shell and other privileged/development grantees.
+         This Activity does not exist in release and cannot select a user rootfs. -->
+    <application>
+        <activity
+            android:name=".runtime.probe.TawcrootPrototypeActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":tawcroot_probe"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+    </application>
 </manifest>

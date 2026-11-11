@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DSH isolated runtime prototype result, schema 1",
+  "type": "object",
+  "required": ["schema", "prototype", "session", "phase", "mode", "suite", "status", "failureStage"],
+  "properties": {
+    "schema": {"const": 1},
+    "prototype": {"const": true},
+    "session": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "runId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "round": {"type": "integer", "minimum": 0},
+    "phase": {"enum": ["prepare", "run", "cleanup"]},
+    "mode": {"enum": ["proot", "direct", "tawcroot"]},
+    "suite": {"enum": ["startup", "pnpm", "apt", "git", "node", "pty", "stop"]},
+    "status": {"enum": ["PASS", "FAILED", "SKIPPED"]},
+    "failureStage": {"type": ["string", "null"]},
+    "actualExecutor": {"type": ["string", "null"]},
+    "executionClassification": {"type": "string"},
+    "exitCode": {"type": ["integer", "null"]},
+    "hostDeadlineExceeded": {"type": "boolean"},
+    "error": {"type": "object"},
+    "identity": {
+      "type": "object",
+      "required": ["abi", "api", "actualTarget", "kernel", "pageSize", "fingerprint", "uid", "selinux", "apkSha256", "runtimeManifestSha256", "tawcManifestSha256", "runtimeVersion", "nativeBinaries", "tawcSource", "ndkVersion"],
+      "properties": {
+        "abi": {"enum": ["arm64-v8a", "x86_64"]},
+        "api": {"type": "integer", "minimum": 29},
+        "actualTarget": {"type": "integer"},
+        "kernel": {"type": "string"},
+        "pageSize": {"type": "integer", "minimum": 1},
+        "fingerprint": {"type": "string"},
+        "uid": {"type": "integer", "minimum": 0},
+        "selinux": {"type": "string"},
+        "apkSha256": {"$ref": "#/$defs/sha256"},
+        "runtimeManifestSha256": {"$ref": "#/$defs/sha256"},
+        "tawcManifestSha256": {"$ref": "#/$defs/sha256"},
+        "runtimeVersion": {"type": "string"},
+        "nativeBinaries": {"type": "object"},
+        "tawcSource": {"type": "object"},
+        "ndkVersion": {"type": "string"}
+      }
+    },
+    "clocks": {
+      "type": "object",
+      "required": ["domain", "processStartNs", "requestedNs", "prepareStartNs", "prepareEndNs", "spawnBeforeNs", "spawnAfterNs", "tokenNs", "portReadyNs", "stopStartNs", "stopEndNs", "finishedNs"],
+      "properties": {
+        "domain": {"const": "android.elapsedRealtimeNanos"},
+        "processStartNs": {"$ref": "#/$defs/time"},
+        "requestedNs": {"$ref": "#/$defs/time"},
+        "prepareStartNs": {"$ref": "#/$defs/time"},
+        "prepareEndNs": {"$ref": "#/$defs/time"},
+        "spawnBeforeNs": {"$ref": "#/$defs/time"},
+        "spawnAfterNs": {"$ref": "#/$defs/time"},
+        "tokenNs": {"$ref": "#/$defs/time"},
+        "portReadyNs": {"$ref": "#/$defs/time"},
+        "stopStartNs": {"$ref": "#/$defs/time"},
+        "stopEndNs": {"$ref": "#/$defs/time"},
+        "finishedNs": {"$ref": "#/$defs/time"}
+      }
+    },
+    "readiness": {
+      "type": "object", "required": ["token", "port"],
+      "properties": {"token": {"type": "boolean"}, "port": {"type": "boolean"}}
+    },
+    "stop": {
+      "type": "object",
+      "required": ["termSent", "prootQuitSent", "killSent", "parentForced", "remainingIdentities", "observationUnavailable", "enumerationFailed", "signalErrors", "clean"],
+      "properties": {
+        "termSent": {"$ref": "#/$defs/count"}, "prootQuitSent": {"$ref": "#/$defs/count"},
+        "killSent": {"$ref": "#/$defs/count"}, "remainingIdentities": {"$ref": "#/$defs/count"},
+        "observationUnavailable": {"$ref": "#/$defs/count"}, "signalErrors": {"$ref": "#/$defs/count"},
+        "parentForced": {"type": "boolean"}, "enumerationFailed": {"type": "boolean"}, "clean": {"type": "boolean"}
+      }
+    },
+    "workload": {
+      "type": ["object", "null"],
+      "properties": {
+        "event": {"enum": ["result", "stop-ready"]},
+        "status": {"enum": ["PASS", "FAILED"]},
+        "main": {"$ref": "#/$defs/command"},
+        "checks": {"type": "array", "items": {"$ref": "#/$defs/command"}},
+        "totalWallNs": {"$ref": "#/$defs/time"},
+        "blockedSyscallProven": {"const": false}
+      }
+    },
+    "cold": {"type": "object"},
+    "resources": {"type": "object"},
+    "resourceMeasurementFailed": {"type": "boolean"},
+    "preparation": {"$ref": "#"},
+    "cleanup": {"$ref": "#"},
+    "host": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PASS"}, "phase": {"enum": ["prepare", "run"]}}},
+      "then": {
+        "required": ["identity", "clocks", "readiness", "stop", "actualExecutor"],
+        "properties": {"failureStage": {"type": "null"}, "stop": {"properties": {"clean": {"const": true}, "killSent": {"const": 0}, "parentForced": {"const": false}}}}
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "PASS"}, "phase": {"const": "run"}, "suite": {"const": "startup"}}},
+      "then": {"properties": {"readiness": {"properties": {"token": {"const": true}, "port": {"const": true}}}}}
+    }
+  ],
+  "$defs": {
+    "time": {"type": ["integer", "null"], "minimum": 0},
+    "count": {"type": "integer", "minimum": 0},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "command": {
+      "type": "object",
+      "required": ["label", "exitCode", "signal", "timedOut", "forced", "streamIncomplete", "wallNs", "stdoutBytes", "stderrBytes", "stdoutSha256", "stderrSha256"],
+      "properties": {
+        "label": {"type": "string"}, "exitCode": {"type": ["integer", "null"]}, "signal": {"type": ["string", "null"]},
+        "timedOut": {"type": "boolean"}, "forced": {"type": "boolean"}, "streamIncomplete": {"type": "boolean"},
+        "wallNs": {"$ref": "#/$defs/time"}, "stdoutBytes": {"$ref": "#/$defs/count"}, "stderrBytes": {"$ref": "#/$defs/count"},
+        "stdoutSha256": {"$ref": "#/$defs/sha256"}, "stderrSha256": {"$ref": "#/$defs/sha256"},
+        "fixtureParentCpuMicros": {"type": "object"}, "cpuScope": {"const": "fixture-parent-only-excludes-tracer-and-children"}
+      }
+    }
+  }
+}
