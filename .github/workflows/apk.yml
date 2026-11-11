@@ -1,0 +1,27 @@
+name: apk
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+      - name: pub get
+        working-directory: app
+        run: flutter pub get
+      - name: build apk
+        working-directory: app
+        run: flutter build apk --release --flavor arm64 --target-platform android-arm64 --build-name 1.0.15 --build-number 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-apk
+          path: app/build/app/outputs/flutter-apk/*.apk
