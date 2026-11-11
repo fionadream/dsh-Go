@@ -101,7 +101,7 @@ class RuntimeController private constructor(private val app: Context) : DshProce
 
     /** The main profile as it was when the current normal run booted; becomes the LKG when healthy. */
     @Volatile private var bootProfile: ProfileSnapshot? = null
-    private val runTail = ArrayDeque<String>()
+    private val runTail = ArrayDeque<CrashClassifier.TailLine>()
     private val networkAccess = NetworkAccess()
     private val dnsLog = DnsConfigLog()
 
@@ -505,7 +505,7 @@ class RuntimeController private constructor(private val app: Context) : DshProce
                                 if (stream != "system") {
                                     synchronized(runTail) {
                                         if (gen == runGen) {
-                                            runTail.addLast(storageLine)
+                                            runTail.addLast(CrashClassifier.TailLine(line, storageLine))
                                             while (runTail.size > CrashClassifier.TAIL_LINES) runTail.removeFirst()
                                         }
                                     }
@@ -998,8 +998,10 @@ class RuntimeController private constructor(private val app: Context) : DshProce
             token = null
             healthyAt = null
             log("[dsh-app] DSH exited with code $code", "system")
-            val tail = synchronized(runTail) { runTail.toList() }
-            var f = CrashClassifier.classify(code, readyAt, SystemClock.elapsedRealtime(), System.currentTimeMillis(), tail, runSafe, source.direct)
+            val output = synchronized(runTail) { runTail.toList() }
+            val tail = output.map { it.storageLine }
+            val signals = output.flatMap { it.signals }.toSet()
+            var f = CrashClassifier.classify(code, readyAt, SystemClock.elapsedRealtime(), System.currentTimeMillis(), tail, runSafe, source.direct, signals)
             val startupError = source.startupError
             // A token deadline must not hide crash evidence already in the tail (#75); a silent
             // loader or a STOP that followed still ends as a plain startup failure.

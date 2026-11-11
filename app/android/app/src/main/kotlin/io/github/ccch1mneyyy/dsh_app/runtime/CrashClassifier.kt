@@ -70,7 +70,7 @@ data class RunFailure(
 object CrashClassifier {
     const val EARLY_WINDOW_MS = 120_000L
 
-    /** Output lines kept per run for classification and the failure log. */
+    /** Output lines and their fixed classification signals kept per run. */
     const val TAIL_LINES = 300
 
     private val FATAL = listOf(
@@ -111,9 +111,32 @@ object CrashClassifier {
     private val REQUIRED_ROW = Regex("^\\s{2}(\\S+) \\(required\\)")
     private val PACKAGE = Regex("^\\s+Package: (\\S+)")
     private val TOKEN = Regex("token=[A-Za-z0-9._~%-]+")
+    private val ANSI = Regex("""\x1B\[[0-9;?]*[ -/]*[@-~]""")
     private const val WEB_MODULES = "/profiles/web/node_modules/"
     private const val SHIPPED_SCOPE = "@deepseek-ai/"
     private const val SUMMARY_MAX = 240
+
+    /** Fixed categories only: no raw output or captured text can enter failure metadata. */
+    enum class Signal { FATAL, HEAP_OOM, NO_SPACE, EXEC_FAILED, PROOT_EXEC_FAILED, DIRECT_FAILED }
+
+    /** The raw line is examined once, then only its signals and the PEM-safe copy are retained. */
+    class TailLine(line: String, val storageLine: String) {
+        val signals: Set<Signal> = if (line == storageLine) emptySet() else detectSignals(line, storageLine)
+    }
+
+    private fun detectSignals(raw: String, storageLine: String): Set<Signal> {
+        // Match the same ANSI-free text as LogRedactor.line, before its PEM state hides a line.
+        val line = ANSI.replace(raw, "")
+        if (line == storageLine) return emptySet() // ANSI removal alone cannot hide a marker.
+        return buildSet {
+            if (isFatal(line)) add(Signal.FATAL)
+            if (HEAP_OOM.matches(line)) add(Signal.HEAP_OOM)
+            if (NO_SPACE.containsMatchIn(line)) add(Signal.NO_SPACE)
+            if (EXEC_FAILED.matches(line)) add(Signal.EXEC_FAILED)
+            if (PROOT_EXEC_FAILED.matches(line)) add(Signal.PROOT_EXEC_FAILED)
+            if (DIRECT_FAILED.any { it.matches(line) }) add(Signal.DIRECT_FAILED)
+        }
+    }
 
     /** A token deadline must not hide existing evidence, nor invent it for a silent loader. */
     fun classifyAfterTokenTimeout(tokenTimedOut: Boolean, failure: RunFailure): Boolean =
@@ -128,6 +151,7 @@ object CrashClassifier {
     /**
      * [readyAt] and [now] share one monotonic clock (elapsedRealtime); [readyAt] is null when
      * the runtime never reported ready. [wallClock] only stamps the result.
+     * [tail] must use the storage copy; [signals] carries only categories hidden by PEM masking.
      */
     fun classify(
         exitCode: Int,
@@ -137,6 +161,7 @@ object CrashClassifier {
         tail: List<String>,
         safeMode: Boolean,
         directEngine: Boolean = false,
+        signals: Set<Signal> = emptySet(),
     ): RunFailure {
         // V8 running out of heap while starting or just after counts like a DSH fatal (#75);
         // later it stays KILLED, which restarts. Neither names a culprit plugin.
@@ -146,10 +171,17 @@ object CrashClassifier {
             EXEC_FAILED.matches(it) || (!directEngine && PROOT_EXEC_FAILED.matches(it)) ||
                 (directEngine && DIRECT_FAILED.any { pattern -> pattern.matches(it) })
         } ?: (if (directEngine && exitCode == SIGSYS_EXIT) SECCOMP_KILLED else null) else null
+        // Signals can recover a marker hidden inside an unfinished PEM block. All text below
+        // (summary, rows, suspects and diagnostics) still comes only from the storage-safe tail.
+        val hasFatal = fatal != null || Signal.FATAL in signals || (early && Signal.HEAP_OOM in signals)
+        val hasLaunch = launch != null || (readyAt == null && exitCode != 0 && (
+            Signal.EXEC_FAILED in signals || (!directEngine && Signal.PROOT_EXEC_FAILED in signals) ||
+                (directEngine && Signal.DIRECT_FAILED in signals)
+            ))
         val kind = when {
-            tail.any { NO_SPACE.containsMatchIn(it) } -> FailureKind.NO_SPACE
-            fatal == null && launch != null -> FailureKind.LAUNCH_FAILED
-            fatal == null -> FailureKind.KILLED
+            Signal.NO_SPACE in signals || tail.any { NO_SPACE.containsMatchIn(it) } -> FailureKind.NO_SPACE
+            !hasFatal && hasLaunch -> FailureKind.LAUNCH_FAILED
+            !hasFatal -> FailureKind.KILLED
             readyAt == null -> FailureKind.STARTUP_FAILED
             now - readyAt <= EARLY_WINDOW_MS -> FailureKind.CRASHED_EARLY
             else -> FailureKind.CRASHED_LATE
