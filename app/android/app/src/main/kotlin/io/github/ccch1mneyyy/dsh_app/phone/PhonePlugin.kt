@@ -58,7 +58,7 @@ class PhonePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
     private var sink: ((Map<String, Any?>) -> Unit)? = null
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-plugin").apply { isDaemon = true } }
-    private val controlIo = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-control").apply { isDaemon = true } }
+    private val controlIo get() = control.controlIo
     @Volatile private var promptOwner = Any()
     @Volatile private var attached = false
     @Volatile private var skillClient: PhoneSkillDrafts.Client? = null
@@ -279,10 +279,12 @@ class PhonePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
                     controlIo.execute { control.background.saveKeep(cleared) }
                     control.background.cancelRootSelection()
                 }
-                async(result) {
-                    val ok = (!enabled || control.background.preparePhoneEnable()) && control.setEnabled(enabled)
-                    if (ok && !enabled) control.background.setBackgroundMode("off")["ok"] == true else ok
-                }
+                control.phoneSwitch.dispatch(enabled, io,
+                    prepareEnable = { control.background.preparePhoneEnable() },
+                    change = { control.setEnabled(it) },
+                    backgroundOff = { control.background.setBackgroundMode("off")["ok"] == true },
+                    complete = { complete(result, it) },
+                )
             }
             "openAccessibilitySettings" -> result.success(startActivity(control.accessibilitySettingsIntent()))
             "openAppDetails" -> result.success(startActivity(control.appDetailsIntent()))

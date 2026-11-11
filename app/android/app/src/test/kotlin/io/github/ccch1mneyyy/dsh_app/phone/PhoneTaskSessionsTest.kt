@@ -1,5 +1,7 @@
 package io.github.ccch1mneyyy.dsh_app.phone
 
+import io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundDisplayIo
+import io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundTaskSlot
 import io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundResourceJournal
 import io.github.ccch1mneyyy.dsh_app.phone.skills.PhoneSkillReplaySelections
 import io.github.ccch1mneyyy.dsh_app.phone.skills.PhoneSkillRoute
@@ -7,6 +9,7 @@ import io.github.ccch1mneyyy.dsh_app.phone.skills.PhoneSkillDrafts
 import io.github.ccch1mneyyy.dsh_app.phone.skills.PhoneSkillOutcomes
 import io.github.ccch1mneyyy.dsh_app.runtime.PhoneSkillBundleReader
 import java.time.ZoneId
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -44,8 +47,10 @@ class PhoneTaskSessionsTest {
     @Volatile private var cancelScope: (PhoneTaskSessions.Task, PhoneTasks.Snapshot) -> Unit = { task, state ->
         if (state.stopped) task.activeWorker?.interruptCurrent(task.tasks)
     }
+    @Volatile private var enabled = true
+    @Volatile private var ownedDriver: ((PhoneScreen, PhoneTasks.Owner) -> PhoneDriver?)? = null
     private val env = object : PhoneEnv {
-        override fun enabled() = true
+        override fun enabled() = this@PhoneTaskSessionsTest.enabled
         override fun policies() = PhonePolicies()
         override fun isLocked() = false
         override fun gate() = object : UserGate {
@@ -63,6 +68,10 @@ class PhoneTaskSessionsTest {
             override fun perform(action: PhoneAction): ActionResult { actions.incrementAndGet(); return ActionResult(true, "done") }
             override fun open(target: PhoneAppIdentity): ActionResult =
                 this@PhoneTaskSessionsTest.open(target).also { if (it.ok) lastOpenedDriver = this }
+        }
+        override fun driver(screen: PhoneScreen, owner: PhoneTasks.Owner): PhoneDriver? {
+            val factory = ownedDriver ?: return driver(screen)
+            return factory(screen, owner)
         }
         override fun existingReplayDriver(owner: PhoneTasks.Owner, app: PhoneAppIdentity): PhoneDriver? = existingReplay(owner, app)
         override fun a11yState() = A11yState.CONNECTED
@@ -101,6 +110,89 @@ class PhoneTaskSessionsTest {
     @After fun close() { pool.shutdownNow(); worker.shutdown(); backgroundWorkers.toList().forEach { it.shutdown() } }
 
     private fun journalCount(): Int = journalBytes?.let { ((Json.parse(it) as Map<*, *>)["records"] as List<*>).size } ?: 0
+
+    @Test fun offOnAndEngineRestartCannotAdmitANewDriverAheadOfOldOffCleanup() {
+        val control = Executors.newSingleThreadExecutor()
+        val oldIo = Executors.newSingleThreadExecutor()
+        val newIo = Executors.newSingleThreadExecutor()
+        val switches = PhoneSwitchDispatch(control)
+        val slot = BackgroundTaskSlot<BackgroundDisplayIo<Any>, Any>(Any())
+        val peer = Any()
+        val observations = AtomicLong()
+        val cleanups = AtomicLong()
+        val modeEntered = CountDownLatch(1); val modeFinished = CountDownLatch(1)
+        val disabled = CountDownLatch(1)
+        ownedDriver = { screen, owner ->
+            val tasks = checkNotNull(sessions.task(owner.taskId)).tasks
+            val original = checkNotNull(slot.acquire(owner, peer, 1, { tasks.isCurrent(owner) }) { BackgroundDisplayIo() })
+            object : PhoneDriver by env.driver(screen) {
+                override fun observe(detail: Boolean, image: Boolean): ScreenSnapshot = original.driver.call {
+                    if (original.driver.peer() == null) {
+                        original.driver.startResource(peer, { beforeSend -> beforeSend(); true }) { it }
+                    } else original.driver.checkDispatch()
+                    observations.incrementAndGet()
+                    ScreenSnapshot("b1", "screen", "Example", "example.app")
+                }
+            }
+        }
+        fun change(on: Boolean): Boolean {
+            enabled = on
+            if (!on) {
+                sessions.stopAll("switch off")
+                slot.seal().forEach { it.driver.seal() }
+                sessions.retire()
+                disabled.countDown()
+            }
+            return true
+        }
+        fun cleanupOff(): Boolean {
+            cleanups.incrementAndGet()
+            return slot.seal().all { record -> record.driver.release { it === peer } && slot.complete(record) }
+        }
+        try {
+            sessions.beginCallerLaunch()
+            assertFalse(screen("old", background = true).isError)
+            val oldOwner = checkNotNull(task("old").tasks.activeOwner())
+            val original = checkNotNull(slot.find(oldOwner))
+            val preparations = backgroundPreparations.get()
+            oldIo.execute { modeEntered.countDown(); check(modeFinished.await(5, TimeUnit.SECONDS)) }
+            assertTrue(modeEntered.await(5, TimeUnit.SECONDS))
+            val off = CompletableFuture<Result<Boolean>>()
+            val on = CompletableFuture<Result<Boolean>>()
+            switches.dispatch(false, oldIo, { true }, ::change, ::cleanupOff, { off.complete(it) })
+            switches.dispatch(true, newIo, { true }, ::change, ::cleanupOff, { on.complete(it) })
+            assertTrue(disabled.await(5, TimeUnit.SECONDS))
+            // These are the real registry boundaries used by stopBridge/prepareLaunch.
+            sessions.retire()
+            sessions.beginCallerLaunch()
+            assertFalse(enabled)
+            assertTrue(original.driver.previewClosed())
+            assertFalse(slot.current(original))
+            assertTrue(screen("new-while-cleaning", background = true).isError)
+            assertEquals(preparations, backgroundPreparations.get())
+            assertEquals(1L, observations.get())
+            assertFalse(on.isDone)
+            modeFinished.countDown()
+            assertTrue(off.get(5, TimeUnit.SECONDS).getOrThrow())
+            assertTrue(on.get(5, TimeUnit.SECONDS).getOrThrow())
+            assertEquals(1L, cleanups.get())
+            assertFalse(slot.occupied)
+            sessions.retire()
+            sessions.beginCallerLaunch()
+            assertFalse(screen("new-after-cleanup", background = true).isError)
+            val successor = checkNotNull(slot.find(checkNotNull(task("new-after-cleanup").tasks.activeOwner())))
+            assertNotSame(original.driver, successor.driver)
+            assertTrue(slot.current(successor))
+            assertFalse(successor.driver.previewClosed())
+            assertEquals(2L, observations.get())
+            assertEquals(1L, cleanups.get())
+        } finally {
+            modeFinished.countDown()
+            control.shutdownNow(); oldIo.shutdownNow(); newIo.shutdownNow()
+            sessions.retire()
+            slot.seal().forEach { record -> record.driver.release { true }; slot.complete(record) }
+        }
+    }
 
     @Test fun callerCapabilitySurvivesRetirementAndOnlyANewLaunchResetsIt() {
         sessions.beginCallerLaunch()

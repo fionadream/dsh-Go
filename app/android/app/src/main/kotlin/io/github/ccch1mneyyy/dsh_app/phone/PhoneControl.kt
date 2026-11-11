@@ -57,6 +57,9 @@ class PhoneControl private constructor(private val app: Context) : PhoneEnv, Con
     private val main = Handler(Looper.getMainLooper())
     private val nm = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     private val ticker = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "dsh-phone-status").apply { isDaemon = true } }
+    // Switch publication remains ordered when Flutter detaches and creates another plugin.
+    internal val controlIo = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-control").apply { isDaemon = true } }
+    internal val phoneSwitch = PhoneSwitchDispatch(controlIo)
 
     private val taskIds = java.util.concurrent.atomic.AtomicLong()
     private val cleanupIo = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-cleanup").apply { isDaemon = true } }
