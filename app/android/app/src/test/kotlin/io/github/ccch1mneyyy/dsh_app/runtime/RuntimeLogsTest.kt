@@ -72,7 +72,7 @@ class RuntimeLogsTest {
         f.flush(); f.drainMain()
         assertEquals(raw, f.logs.recent(10))
         assertEquals(raw, f.delivered.map { it.line })
-        assertEquals(listOf("•••", "•••", end, "done"), f.saved())
+        assertEquals(listOf(begin, "•••", end, "done"), f.saved())
     }
 
     @Test fun concurrentAdmissionHasOneOrderAndSnapshotCutoff() = Fixture().use { f ->
