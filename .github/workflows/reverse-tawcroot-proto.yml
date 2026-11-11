@@ -1,0 +1,243 @@
+# TEMPORARY prototype workflow for the tawcroot measurement. Never merge.
+# Runs only on pushes to reverse/tawcroot-proto. Builds Pro's 5040 tawcroot prototype for both
+# ABIs, the x86_64 runtime, a host-side PRoot / tawcroot / chroot comparison on this Linux
+# runner (NOT Android), the existing Direct host harness, and the opt-in x64 debug APK.
+name: reverse-tawcroot-proto
+
+on:
+  push:
+    branches: [reverse/tawcroot-proto]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  NODE_VERSION: 24.22.1
+  GRADLE_VERSION: 9.3.1
+  NDK_VERSION: 28.2.13676358
+  TAWC_ARCHIVE_SHA256: 74487243bde86c303e786e79cd4a13e98c3279cae4ab7725dcf5fa51c0b530c1
+  TAWC_COMMIT: a49a4075228f4801dadc1eee584aed33fe8ea4ce
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  proto:
+    name: tawcroot prototype build and host measurement
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    env:
+      DSH_MAVEN_MIRRORS: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Environment
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost || true
+          mkdir -p "$RUNNER_TEMP/out"
+          {
+            echo "head=$(git rev-parse HEAD)"
+            . /etc/os-release; echo "os=$PRETTY_NAME"
+            echo "uname=$(uname -a)"
+            echo "nproc=$(nproc)"
+            free -m
+            lscpu | sed -n '1,20p'
+            df -h / | tail -1
+          } | tee "$RUNNER_TEMP/out/env.txt"
+
+      - name: Pro tawcroot Python tests (5040 / 5052)
+        continue-on-error: true
+        run: |
+          python3 -I runtime/tests/test_tawcroot_build.py -v 2>&1 | tail -25 | tee "$RUNNER_TEMP/out/py-build-tests.txt"
+          python3 -I runtime/tests/test_tawcroot_measure.py -v 2>&1 | tail -30 | tee "$RUNNER_TEMP/out/py-measure-tests.txt"
+          node --check runtime/prototypes/tawcroot/fixtures/workloads.mjs && echo "workloads.mjs syntax ok"
+
+      - name: Build libtawcroot.so (5040 build.py, existing NDK only)
+        run: |
+          ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
+          if [[ ! -d $ndk ]]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
+          fi
+          grep Pkg.Revision "$ndk/source.properties"
+          start=$(date +%s)
+          python3 -I runtime/prototypes/tawcroot/build.py --ndk "$ndk"
+          echo "TAWC build seconds=$(( $(date +%s) - start ))"
+          got=$(sha256sum "runtime/.cache/tawcroot/$TAWC_COMMIT.zip" | cut -d' ' -f1)
+          echo "TAWC archive sha256=$got expected=$TAWC_ARCHIVE_SHA256"
+          [[ $got == "$TAWC_ARCHIVE_SHA256" ]]
+          out=runtime/.work/tawcroot-prototype/out
+          cat "$out/manifest.json" | tee "$RUNNER_TEMP/out/tawcroot-manifest.json"
+          for abi in arm64-v8a x86_64; do
+            file "$out/jniLibs/$abi/libtawcroot.so"
+            readelf -lW "$out/jniLibs/$abi/libtawcroot.so" | sed -n '1,25p'
+          done
+
+      - name: Official PRoot debs (Termux run 39199950210, pinned bytes)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .reverse/tawc/006-official-proot-cache.sh "$PWD"
+
+      - name: Build x86_64 runtime
+        run: |
+          start=$(date +%s)
+          bash runtime/build-runtime.sh x86_64 2>&1 | tail -40
+          echo "RUNTIME build seconds=$(( $(date +%s) - start ))"
+          python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print({k:m.get(k) for k in ("schema","runtimeVersion","abi","dshVersion","nodeVersion","prootVersion")})' \
+            runtime/out/x86_64/assets/runtime/manifest.json | tee "$RUNNER_TEMP/out/runtime-manifest-brief.txt"
+
+      - name: Linux build of the pinned PRoot source
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libtalloc-dev >/dev/null
+          src="$RUNNER_TEMP/proot-src"; mkdir -p "$src"
+          unzip -q runtime/.cache/termux/proot-v5.1.107.98.zip -d "$src"
+          dir=$(ls -d "$src"/proot-*)
+          if make -C "$dir/src" -j"$(nproc)" > "$RUNNER_TEMP/out/proot-make.log" 2>&1; then
+            echo "PROOT=$dir/src/proot" >> "$GITHUB_ENV"
+            loader=$(ls "$dir"/src/loader/loader 2>/dev/null || true)
+            [[ -n $loader ]] && echo "PROOT_LOADER_PATH=$loader" >> "$GITHUB_ENV"
+            echo "PROOT_KIND=pinned-source-5.1.107.98" >> "$GITHUB_ENV"
+          else
+            tail -30 "$RUNNER_TEMP/out/proot-make.log"
+            sudo apt-get install -y -qq proot >/dev/null
+            echo "PROOT=/usr/bin/proot" >> "$GITHUB_ENV"
+            echo "PROOT_KIND=ubuntu-apt" >> "$GITHUB_ENV"
+          fi
+
+      - name: Disposable rootfs copies and benchmark repository
+        run: |
+          echo "proot kind=$PROOT_KIND path=$PROOT loader=${PROOT_LOADER_PATH:-none}" | tee -a "$RUNNER_TEMP/out/env.txt"
+          "$PROOT" --version 2>&1 | head -3 | tee -a "$RUNNER_TEMP/out/env.txt" || true
+          W="$RUNNER_TEMP/bench"; T="$W/template"; mkdir -p "$T"
+          echo "W=$W" >> "$GITHUB_ENV"
+          M=runtime/out/x86_64/assets/runtime/manifest.json
+          python3 -I - "$M" > "$W/archives.txt" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          if m.get("schema", 1) == 1:
+              print(m["rootfs"])
+          else:
+              for layer in ("base", "engine"):
+                  print(m["layers"][layer]["asset"])
+          PY
+          while read -r a; do tar -xf "$(dirname "$M")/$a" -C "$T"; done < "$W/archives.txt"
+          rm -f "$T/etc/resolv.conf"; cp -L /etc/resolv.conf "$T/etc/resolv.conf"
+          for f in "$T"/etc/apt/sources.list "$T"/etc/apt/sources.list.d/*; do
+            [[ -f $f ]] && sed -i 's#https\?://mirrors.tuna.tsinghua.edu.cn/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' "$f"
+          done
+          grep -rh "^URIs\|^deb " "$T"/etc/apt/sources.list* 2>/dev/null | sort -u | head
+          mkdir -p "$T/tmp/bench" "$T/root/repo"; cp .reverse/tawc/probe.mjs "$T/tmp/bench/"
+          ls "$T/opt/dsh-go/direct/preload.mjs" && echo "direct preload present"
+          # apt indexes and the hello .deb once, untimed, through the pinned PRoot (as the app would).
+          mkdir -p "$W/tmp-template"
+          env PROOT_TMP_DIR="$W/tmp-template" PROOT_L2S_DIR="$T/root/.l2s" ${PROOT_LOADER_PATH:+PROOT_LOADER=$PROOT_LOADER_PATH} \
+            "$PROOT" --link2symlink -0 --rootfs="$T" --cwd=/root -b /dev -b /proc -b /sys \
+            /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root /bin/sh -c \
+            'apt-get update -qq && apt-get install -y -qq --download-only hello && ls /var/cache/apt/archives/*.deb'
+          for m in proot tawcroot chroot direct; do mkdir -p "$W/$m"; cp -a "$T" "$W/$m/rootfs"; done
+          du -sh "$T"
+          start=$(date +%s)
+          git clone -q --depth 1 --branch v24.22.1 https://github.com/nodejs/node "$W/repo"
+          echo "repo clone seconds=$(( $(date +%s) - start )) files=$(git -C "$W/repo" ls-files | wc -l)" | tee -a "$RUNNER_TEMP/out/env.txt"
+          for i in 1 2 3 4 5 6; do s=$(date +%s%N); git -C "$W/repo" status --porcelain >/dev/null; echo "host-native git status $(( ($(date +%s%N) - s) / 1000000 )) ms"; done | tee -a "$RUNNER_TEMP/out/env.txt"
+          rm -rf "$T"
+          df -h / | tail -1
+
+      - name: tawcroot smoke
+        continue-on-error: true
+        run: |
+          TAWC="$PWD/runtime/.work/tawcroot-prototype/out/jniLibs/x86_64/libtawcroot.so"
+          echo "TAWC=$TAWC" >> "$GITHUB_ENV"
+          R="$W/tawcroot/rootfs"
+          (cd "$R/root" && timeout 60 "$TAWC" -s -r "$R" -b /dev:/dev -b /proc:/proc -b /sys:/sys -- \
+            /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root /bin/sh -c \
+            'echo tawc-smoke-ok; id; pwd; ls / | head -5; /opt/node/bin/node -e "console.log(process.version)"'); echo "exit=$?"
+
+      - name: Host benchmark (PRoot / tawcroot / chroot)
+        continue-on-error: true
+        timeout-minutes: 75
+        run: |
+          R="$W/chroot/rootfs"
+          sudo mount --rbind /dev "$R/dev" && sudo mount --make-rslave "$R/dev"
+          sudo mount -t proc proc "$R/proc"
+          sudo mount --rbind /sys "$R/sys" && sudo mount --make-rslave "$R/sys"
+          sudo mount --bind "$W/repo" "$R/root/repo"
+          python3 -I .reverse/tawc/host_bench.py \
+            --manifest runtime/out/x86_64/assets/runtime/manifest.json \
+            --work "$W" --out "$RUNNER_TEMP/out/bench" \
+            --proot "$PROOT" --proot-loader "${PROOT_LOADER_PATH:-}" --tawcroot "$TAWC" \
+            --repo "$W/repo" --rounds 10 2>&1 | tee "$RUNNER_TEMP/out/bench.log" | grep -E '^(BENCH|SUMMARY)|Traceback|Error' || true
+          sudo umount -R "$R/dev" "$R/sys" "$R/proc" "$R/root/repo" 2>/dev/null || sudo umount -lR "$R/dev" "$R/sys" "$R/proc" "$R/root/repo" || true
+          du -sh "$W/tawcroot/tawcroot" "$W/proot/rootfs/root/.l2s" 2>/dev/null | tee -a "$RUNNER_TEMP/out/env.txt" || true
+
+      - name: Existing Direct host harness (real DirectLaunch planner vs the same PRoot)
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          command -v kotlinc && kotlinc -version 2>&1 | tail -1
+          D="$RUNNER_TEMP/out/direct"; mkdir -p "$D"
+          bash runtime/tests/direct/compile-host-plan.sh "$W/host-plan.jar" > "$D/compile.log" 2>&1
+          python3 runtime/tests/direct/run-host.py --rootfs "$W/direct/rootfs" \
+            --manifest runtime/out/x86_64/assets/runtime/manifest.json --proot "$PROOT" \
+            --planner "$W/host-plan.jar" --ownership-helper "$W/host-plan-ownership.jar" \
+            --output "$D/web" --samples 10 --port 39120 2>&1 | tail -40
+
+      - name: Free benchmark disk
+        if: always()
+        run: sudo rm -rf "$W" || true
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: 5041 TawcrootLaunchTest and opt-in x64 debug APK
+        continue-on-error: true
+        run: |
+          (cd app && flutter pub get --enforce-lockfile >/dev/null &&
+            printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties)
+          (cd app/android && gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin -q)
+          (cd app/android && DSH_TAWCROOT_PROTOTYPE=1 gradle -q :app:testX64DebugUnitTest \
+            --tests 'io.github.ccch1mneyyy.dsh_app.runtime.probe.TawcrootLaunchTest'); echo "JUNIT exit=$?" | tee "$RUNNER_TEMP/out/junit.txt"
+          find app/android/app/build/test-results -name 'TEST-*Tawcroot*.xml' -exec cp {} "$RUNNER_TEMP/out/" \; || true
+          DSH_TAWCROOT_PROTOTYPE=1 bash tooling/build-apk.sh --debug -f x64 2>&1 | tail -15; echo "APK exit=${PIPESTATUS[0]}" | tee "$RUNNER_TEMP/out/apk.txt"
+          mkdir -p "$RUNNER_TEMP/apk"
+          cp app/build/app/outputs/flutter-apk/app-x64-debug.apk "$RUNNER_TEMP/apk/" && sha256sum "$RUNNER_TEMP/apk/app-x64-debug.apk" | tee -a "$RUNNER_TEMP/out/apk.txt"
+          cp runtime/.work/tawcroot-prototype/out/manifest.json "$RUNNER_TEMP/apk/tawcroot-out-manifest.json"
+
+      - name: Collect tawcroot OUT
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/tawcroot-out"
+          cp -r runtime/.work/tawcroot-prototype/out/. "$RUNNER_TEMP/out/tawcroot-out/" || true
+          cp runtime/out/x86_64/assets/runtime/manifest.json "$RUNNER_TEMP/out/runtime-manifest.json" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tawcroot-proto-results
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+      - name: Upload opt-in debug APK
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tawcroot-proto-apk-x64-debug
+          path: ${{ runner.temp }}/apk
+          retention-days: 14
