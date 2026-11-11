@@ -45,7 +45,8 @@ def guest_template(manifest):
     tail = argv[argv.index("/usr/bin/env"):]
     sh = tail.index("/bin/sh")
     env = []
-    for item in tail[:sh]:
+    assert tail[:2] == ["/usr/bin/env", "-i"], tail[:2]
+    for item in tail[2:sh]:  # callers add "/usr/bin/env -i" themselves
         if item == "{GUEST_ENV}":
             env += [FAKE_KEY, "TZ=UTC"]
         elif item.startswith("pnpm_config_registry="):
@@ -87,9 +88,12 @@ class Mode:
         host_env = {"PATH": "/usr/bin:/bin", "HOME": str(plan_dir), "PROOT_L2S_DIR": str(self.root / "root/.l2s")}
         (plan_dir / "input-argv.nul").write_bytes(("\0".join(prefix + tail) + "\0").encode())
         (plan_dir / "input-env.nul").write_bytes(("\0".join(f"{k}={v}" for k, v in host_env.items()) + "\0").encode())
-        subprocess.run(["java", "-jar", self.args.planner, str(self.root), "x86_64", str(plan_dir / "input-argv.nul"),
-                        str(plan_dir / "input-env.nul"), str(plan_dir), "/bin/sh", "direct"], check=True,
-                       capture_output=True)
+        done = subprocess.run(["java", "-jar", self.args.planner, str(self.root), "x86_64",
+                               str(plan_dir / "input-argv.nul"), str(plan_dir / "input-env.nul"), str(plan_dir),
+                               "/bin/sh", "direct"], capture_output=True, text=True)
+        (plan_dir / "planner.log").write_text(done.stdout + done.stderr)
+        if done.returncode:
+            raise RuntimeError("planner failed: " + (done.stderr or done.stdout)[-800:])
         argv = [v for v in (plan_dir / "argv.nul").read_bytes().decode().split("\0") if v]
         env = dict(v.split("=", 1) for v in (plan_dir / "env.nul").read_bytes().decode().split("\0") if v)
         selection = json.loads((plan_dir / "selection.json").read_text())
@@ -177,8 +181,15 @@ def startup_once(mode, env, command, logs):
     if mode.name == "direct":
         # Planning (the app's Kotlin prepare step) happens before t0, like the other modes' argv building.
         plain = ["/usr/bin/env", "-i", *env, "/bin/sh", "-c", command.replace("{PORT}", str(port))]
-        argv, launch_env, cwd, selection = mode.direct_plan(plain, logs / f"direct-plan-{time.time_ns()}")
+        try:
+            argv, launch_env, cwd, selection = mode.direct_plan(plain, logs / f"direct-plan-{time.time_ns()}")
+        except (OSError, RuntimeError, ValueError) as error:
+            row.update(stage="direct-planner", error=str(error)[-800:])
+            return row
         row["directSelection"] = selection
+        if selection.get("actual") != "direct":
+            row.update(stage="direct-fell-back", error=str(selection))
+            return row
         launch_env["NODE_OPTIONS"] = (launch_env.get("NODE_OPTIONS", "") + " --import=" +
                                       str(root / "tmp/bench/probe.mjs")).strip()
         launch_env["BENCH_PROBE_OUT"] = str(probe)
