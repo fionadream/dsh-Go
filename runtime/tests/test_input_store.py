@@ -59,10 +59,10 @@ class InputStoreTest(unittest.TestCase):
     def test_inventory_reads_changed_pin_and_selected_lock(self):
         repo = self.root / "repo"
         (repo / "runtime").mkdir(parents=True)
-        shell = (REPO / "runtime/build-runtime.sh").read_text()
+        shell = (REPO / "runtime/build-runtime.sh").read_text(encoding="utf-8")
         _, pins = store.shell_inputs(REPO)
         old = pins["proot-v5.1.107.98.zip"]
-        (repo / "runtime/build-runtime.sh").write_text(shell.replace(old, "f" * 64))
+        (repo / "runtime/build-runtime.sh").write_text(shell.replace(old, "f" * 64), encoding="utf-8")
         shutil.copytree(REPO / "runtime/locks", repo / "runtime/locks")
         lock = repo / "runtime/locks/pnpm-11.28.5/package-lock.json"
         selected = store.inventory(repo, [lock])
@@ -81,32 +81,32 @@ class InputStoreTest(unittest.TestCase):
         repo = self.root / "repo"
         (repo / "runtime").mkdir(parents=True)
         shutil.copytree(REPO / "runtime/locks", repo / "runtime/locks")
-        shell = (REPO / "runtime/build-runtime.sh").read_text()
+        shell = (REPO / "runtime/build-runtime.sh").read_text(encoding="utf-8")
         for extra, message in (("  [new-fixed-input.tar.gz]=" + "0" * 64, "uncovered"),
                                ("  [new-fixed-input.tar.gz]=${SOURCE_HASH}", "unparsed")):
             with self.subTest(message=message):
                 source = shell.replace("declare -A PIN=(\n", "declare -A PIN=(\n" + extra + "\n")
-                (repo / "runtime/build-runtime.sh").write_text(source)
+                (repo / "runtime/build-runtime.sh").write_text(source, encoding="utf-8")
                 with self.assertRaisesRegex(store.InputError, message):
                     store.inventory(repo)
 
     def test_current_pnpm_pin_and_lock_must_agree(self):
         repo = self.root / "repo"
-        shell = (REPO / "runtime/build-runtime.sh").read_text()
+        shell = (REPO / "runtime/build-runtime.sh").read_text(encoding="utf-8")
         source = self.file("repo/runtime/build-runtime.sh", shell.encode())
         shutil.copytree(REPO / "runtime/locks", repo / "runtime/locks")
         values, _ = store.shell_inputs(repo)
         lock = repo / ("runtime/locks/pnpm-" + values["PNPM_VERSION"] + "/package-lock.json")
         replacement = "sha512-" + base64.b64encode(hashlib.sha512(b"changed source pin").digest()).decode()
-        source.write_text(shell.replace(values["PNPM_INTEGRITY"], replacement))
+        source.write_text(shell.replace(values["PNPM_INTEGRITY"], replacement), encoding="utf-8")
         for all_locks in (False, True):
             with self.subTest(change="source integrity", all_locks=all_locks):
                 with self.assertRaisesRegex(store.InputError, "pnpm.*pins"):
                     store.inventory(repo, all_locks=all_locks)
-        source.write_text(shell)
-        data = json.loads(lock.read_text())
+        source.write_text(shell, encoding="utf-8")
+        data = json.loads(lock.read_text(encoding="utf-8"))
         data["packages"]["node_modules/pnpm"]["version"] = "0.0.0-fixture"
-        lock.write_text(json.dumps(data))
+        lock.write_text(json.dumps(data), encoding="utf-8")
         for all_locks in (False, True):
             with self.subTest(change="lock version", all_locks=all_locks):
                 with self.assertRaisesRegex(store.InputError, "pnpm.*pins"):
@@ -241,6 +241,50 @@ class InputStoreTest(unittest.TestCase):
                     with self.assertRaises((store.InputError, OSError)):
                         store.store_stream(io.BytesIO(b"data"), obj, self.cas)
                 self.assertEqual(replace.call_count, int(fail_replace))
+                self.assertFalse(list(self.cas.iterdir()))
+
+    def test_stream_limit_stops_after_one_extra_byte_and_keeps_existing_object(self):
+        class ShortRead(io.BytesIO):
+            def read(self, count):
+                return super().read(min(count, 3))
+
+        for expected_size in (0, 4, None):
+            with self.subTest(expected_size=expected_size):
+                limit = expected_size if expected_size is not None else 8
+                obj = original(b"a" * limit, size=expected_size)
+                destination = self.file("store/" + obj["key"], b"existing object")
+                source = ShortRead(b"a" * limit + b"extra data remains unread")
+                reason = "size exceeds expected bytes" if expected_size is not None else "transfer limit"
+                with patch.object(store, "MAX_UNKNOWN_BYTES", 8, create=True):
+                    with self.assertRaisesRegex(store.InputError, reason):
+                        store.store_stream(source, obj, self.cas)
+                self.assertEqual(source.tell(), limit + 1)
+                self.assertEqual(destination.read_bytes(), b"existing object")
+                self.assertFalse(list(self.cas.glob(".part-*")))
+
+    def test_exact_size_and_unknown_limit_allow_complete_verified_objects(self):
+        for expected_size, length in ((0, 0), (4, 4), (9, 9), (None, 0), (None, 8)):
+            with self.subTest(expected_size=expected_size, length=length):
+                payload = b"a" * length
+                obj = original(payload, size=expected_size)
+                with patch.object(store, "MAX_UNKNOWN_BYTES", 8, create=True):
+                    destination = store.store_stream(io.BytesIO(payload), obj, self.cas)
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertFalse(list(self.cas.glob(".part-*")))
+
+    def test_size_limit_stops_collection_without_mirror_or_later_object(self):
+        for expected_size in (4, None):
+            with self.subTest(expected_size=expected_size):
+                limit = expected_size if expected_size is not None else 8
+                obj = original(b"a" * limit, ["https://example.invalid/original"], size=expected_size)
+                later = original(b"next", ["https://example.invalid/next"])
+                with patch.object(store, "MAX_UNKNOWN_BYTES", 8, create=True), \
+                        patch.object(store.urllib.request, "urlopen", return_value=io.BytesIO(b"a" * (limit + 10))) as opener:
+                    result = store.collect_objects([obj, later], self.cas, "https://example.invalid/mirror")
+                self.assertEqual(opener.call_count, 1)
+                self.assertTrue(result["stopped"])
+                self.assertEqual(result["collected"], 0)
+                self.assertEqual(len(result["errors"]), 1)
                 self.assertFalse(list(self.cas.iterdir()))
 
     def test_import_identifies_bytes_not_names_and_verify_reports_all_errors(self):
@@ -389,7 +433,7 @@ class InputStoreTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertEqual(lock.read_bytes(), before)
         for name in dependencies:
-            self.assertEqual((project / "node_modules" / name / "payload.txt").read_text(), "local payload: " + name)
+            self.assertEqual((project / "node_modules" / name / "payload.txt").read_text(encoding="utf-8"), "local payload: " + name)
 
 
 if __name__ == "__main__":

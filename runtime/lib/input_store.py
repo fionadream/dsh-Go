@@ -16,6 +16,9 @@ import urllib.parse
 import urllib.request
 
 
+MAX_UNKNOWN_BYTES = 1024 * 1024 * 1024
+
+
 class InputError(Exception):
     pass
 
@@ -25,7 +28,7 @@ class TransportError(InputError):
 
 
 def shell_inputs(repo):
-    source = (repo / "runtime/build-runtime.sh").read_text()
+    source = (repo / "runtime/build-runtime.sh").read_text(encoding="utf-8")
     values = {}
     for name, value in re.findall(r'^([A-Z][A-Z0-9_]*)="([^"\n]*)"', source, re.M):
         default = re.fullmatch(r"\$\{" + name + r":-(.*)\}", value)
@@ -69,7 +72,7 @@ def lock_label(lock, repo):
 
 
 def add_npm_lock(objects, lock, repo):
-    data = json.loads(lock.read_text())
+    data = json.loads(lock.read_text(encoding="utf-8"))
     for package_path, package in data["packages"].items():
         if not package_path:
             continue
@@ -128,7 +131,7 @@ def inventory(repo, npm_locks=None, all_locks=False):
             pinned(name, [values["TERMUX_REPO"] + "/pool/main/" + pool + "/" + package + "/" + name], abi, "termux_jni")
         lock = repo / ("runtime/locks/ubuntu-noble-" + ubuntu + ".json")
         mirror = values["UBUNTU_ARCHIVE_" + ("AMD64" if ubuntu == "amd64" else "ARM64")]
-        for index, package in enumerate(json.loads(lock.read_text())["packages"]):
+        for index, package in enumerate(json.loads(lock.read_text(encoding="utf-8"))["packages"]):
             name = Path(package["filename"]).name
             urls = [mirror + "/" + package["filename"]]
             if "UBUNTU_DEB_FALLBACK" in values:
@@ -149,7 +152,7 @@ def inventory(repo, npm_locks=None, all_locks=False):
     else:
         defaults = [repo / ("runtime/locks/" + name + "/package-lock.json") for name in
                     ("dsh-" + values["DSH_VERSION"], "pnpm-" + values["PNPM_VERSION"])]
-        pnpm = json.loads(defaults[1].read_text())["packages"].get("node_modules/pnpm", {})
+        pnpm = json.loads(defaults[1].read_text(encoding="utf-8"))["packages"].get("node_modules/pnpm", {})
         if pnpm.get("version") != values["PNPM_VERSION"] or pnpm.get("integrity") != values["PNPM_INTEGRITY"]:
             raise InputError("current pnpm lock version/integrity does not match source pins")
         locks = sorted(set(defaults) | set((repo / "runtime/locks").glob("*/package-lock.json"))) if all_locks else defaults
@@ -179,16 +182,20 @@ def store_stream(source, obj, store):
             temporary = Path(output.name)
             digest = hashlib.new(obj["algorithm"])
             size = 0
+            limit = obj["size"] if obj["size"] is not None else MAX_UNKNOWN_BYTES
             while True:
                 try:
-                    chunk = source.read(1024 * 1024)
+                    chunk = source.read(min(1024 * 1024, limit - size + 1))
                 except (OSError, http.client.HTTPException) as error:
                     raise TransportError("input read failed: " + type(error).__name__) from error
                 if not chunk:
                     break
+                size += len(chunk)
+                if size > limit:
+                    reason = "size exceeds expected bytes" if obj["size"] is not None else "input exceeds transfer limit"
+                    raise InputError(reason + ": " + obj["key"])
                 output.write(chunk)
                 digest.update(chunk)
-                size += len(chunk)
             if digest.hexdigest() != obj["digest"]:
                 raise InputError("checksum mismatch: " + obj["key"])
             if obj["size"] is not None and size != obj["size"]:
