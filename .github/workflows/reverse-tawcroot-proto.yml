@@ -68,7 +68,7 @@ jobs:
         run: |
           ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
           if [[ ! -d $ndk ]]; then
-            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
+            (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > "$RUNNER_TEMP/out/ndk-install.log" 2>&1 || { tail -20 "$RUNNER_TEMP/out/ndk-install.log"; exit 1; }
           fi
           grep Pkg.Revision "$ndk/source.properties"
           start=$(date +%s)
@@ -134,9 +134,9 @@ jobs:
           while read -r a; do tar -xf "$(dirname "$M")/$a" -C "$T"; done < "$W/archives.txt"
           rm -f "$T/etc/resolv.conf"; cp -L /etc/resolv.conf "$T/etc/resolv.conf"
           for f in "$T"/etc/apt/sources.list "$T"/etc/apt/sources.list.d/*; do
-            [[ -f $f ]] && sed -i 's#https\?://mirrors.tuna.tsinghua.edu.cn/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' "$f"
+            if [[ -f $f ]]; then sed -i 's#https\?://mirrors.tuna.tsinghua.edu.cn/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' "$f"; fi
           done
-          grep -rh "^URIs\|^deb " "$T"/etc/apt/sources.list* 2>/dev/null | sort -u | head
+          (grep -rh "^URIs\|^deb " "$T"/etc/apt/sources.list* 2>/dev/null | sort -u) || true
           mkdir -p "$T/tmp/bench" "$T/root/repo"; cp .reverse/tawc/probe.mjs "$T/tmp/bench/"
           ls "$T/opt/dsh-go/direct/preload.mjs" && echo "direct preload present"
           # apt indexes and the hello .deb once, untimed, through the pinned PRoot (as the app would).
