@@ -6,7 +6,8 @@ import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import { isMainThread } from 'node:worker_threads';
 
-const OUT = '/tmp/bench/probe.jsonl';
+// Direct mode has no fs path translation, so the harness passes the physical path.
+const OUT = process.env.BENCH_PROBE_OUT || '/tmp/bench/probe.jsonl';
 if (isMainThread && process.argv.includes('web') && process.argv.some((v) => v.includes('@deepseek-ai/dsh'))) {
   const emit = (event) => {
     try {

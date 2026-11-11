@@ -67,11 +67,33 @@ class Mode:
             if (root / host).is_dir():
                 self.extra_binds.append(f"{root}/{host}:{guest}")
         if args.repo:
+            # One copy per mode: git's index records st_uid, which differs between fake-root
+            # launchers (0) and the real-root chroot view (the runner uid) and would force rehashes.
+            repo = f"{args.repo}-{name}" if Path(f"{args.repo}-{name}").is_dir() else args.repo
             (root / "root/repo").mkdir(parents=True, exist_ok=True)
-            self.extra_binds.append(f"{args.repo}:/root/repo")
-        if name == "proot":
+            self.extra_binds.append(f"{repo}:/root/repo")
+        if name in ("proot", "direct"):
             help_text = subprocess.run([args.proot, "--help"], capture_output=True, text=True).stdout
             self.proot_flags = [f for f in ("--kill-on-exit", "--link2symlink", "--sysvipc", "-L") if f in help_text]
+
+    def direct_plan(self, guest, plan_dir):
+        """Ask the production DirectLaunch planner (HostPlan.kt jar), as runtime/tests/direct does."""
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        prefix = [self.args.proot, *self.proot_flags, "-0", f"--rootfs={self.root}", "--cwd=/root",
+                  "-b", "/dev", "-b", "/proc"]
+        tail = list(guest)
+        at = tail.index("/bin/sh")
+        tail[at:at] = ["DSH_GO_RUNTIME_ROOT=" + str(self.root)]
+        host_env = {"PATH": "/usr/bin:/bin", "HOME": str(plan_dir), "PROOT_L2S_DIR": str(self.root / "root/.l2s")}
+        (plan_dir / "input-argv.nul").write_bytes(("\0".join(prefix + tail) + "\0").encode())
+        (plan_dir / "input-env.nul").write_bytes(("\0".join(f"{k}={v}" for k, v in host_env.items()) + "\0").encode())
+        subprocess.run(["java", "-jar", self.args.planner, str(self.root), "x86_64", str(plan_dir / "input-argv.nul"),
+                        str(plan_dir / "input-env.nul"), str(plan_dir), "/bin/sh", "direct"], check=True,
+                       capture_output=True)
+        argv = [v for v in (plan_dir / "argv.nul").read_bytes().decode().split("\0") if v]
+        env = dict(v.split("=", 1) for v in (plan_dir / "env.nul").read_bytes().decode().split("\0") if v)
+        selection = json.loads((plan_dir / "selection.json").read_text())
+        return argv, env, (plan_dir / "cwd.txt").read_text(), selection
 
     @property
     def cwd(self):
@@ -152,9 +174,19 @@ def startup_once(mode, env, command, logs):
     guest = ["/usr/bin/env", "-i", *genv, "/bin/sh", "-c", command.replace("{PORT}", str(port))]
     errlog = logs / f"{mode.name}-startup-{time.time_ns()}.stderr"
     row = {"mode": mode.name, "ok": False}
+    if mode.name == "direct":
+        # Planning (the app's Kotlin prepare step) happens before t0, like the other modes' argv building.
+        plain = ["/usr/bin/env", "-i", *env, "/bin/sh", "-c", command.replace("{PORT}", str(port))]
+        argv, launch_env, cwd, selection = mode.direct_plan(plain, logs / f"direct-plan-{time.time_ns()}")
+        row["directSelection"] = selection
+        launch_env["NODE_OPTIONS"] = (launch_env.get("NODE_OPTIONS", "") + " --import=" +
+                                      str(root / "tmp/bench/probe.mjs")).strip()
+        launch_env["BENCH_PROBE_OUT"] = str(probe)
+    else:
+        argv, launch_env, cwd = mode.argv(guest), mode.env, mode.cwd
     with errlog.open("wb") as err:
         t0 = time.time()
-        proc = subprocess.Popen(mode.argv(guest), cwd=mode.cwd, env=mode.env, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(argv, cwd=cwd, env=launch_env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=err, start_new_session=True)
         token, buf, t_token = None, b"", None
         deadline = t0 + 180
@@ -210,9 +242,14 @@ def startup_once(mode, env, command, logs):
         try:
             gpid = int(pidfile.read_text().strip())
             row["termSent"] = mode.kill(gpid, signal.SIGTERM)
+            row["stopMethod"] = "pidfile"
         except (OSError, ValueError):
-            row["termSent"] = False
-            row["pidFile"] = "missing"
+            row["stopMethod"] = "process-group"
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                row["termSent"] = True
+            except OSError:
+                row["termSent"] = False
         try:
             proc.wait(timeout=20)
             row["launcherExited"] = True
@@ -281,7 +318,7 @@ def ctrl_c_once(mode, env):
     row = {"mode": mode.name}
     os.write(fd, b"echo PTY_READY_$((40+2))\n")
     row["ready"] = read_until(rb"PTY_READY_42", 30)
-    os.write(fd, b"sleep 30; echo SLEEP_NOT_INTERRUPTED\n")
+    os.write(fd, b"sleep 30; echo SLEEP_$((6*7))_END\n")
     time.sleep(1.5)
     t0 = time.time()
     os.write(fd, b"\x03")
@@ -290,7 +327,7 @@ def ctrl_c_once(mode, env):
     row["interruptMs"] = (time.time() - t0) * 1000
     status = re.search(rb"CTRLC_DONE_(\d+)", seen)
     row["statusAfterInterrupt"] = int(status.group(1)) if status else None
-    row["sleepFinished"] = b"SLEEP_NOT_INTERRUPTED" in seen
+    row["sleepFinished"] = b"SLEEP_42_END" in seen  # only the command's output, never the echoed input
     os.write(fd, b"exit\n")
     end = time.time() + 15
     exited = False
@@ -341,9 +378,10 @@ def main():
     p.add_argument("--proot-loader", default="")
     p.add_argument("--tawcroot", required=True)
     p.add_argument("--repo", default="")
+    p.add_argument("--planner", default="", help="HostPlan jar (runtime/tests/direct/compile-host-plan.sh) for the direct mode")
     p.add_argument("--rounds", type=int, default=10)
     p.add_argument("--modes", default=",".join(MODES))
-    p.add_argument("--suites", default="startup,ctrlc,pnpm,apt,git")
+    p.add_argument("--suites", default="startup,ctrlc,plugin,pnpm,apt,git")
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     logs = args.out / "stderr"
@@ -362,10 +400,23 @@ def main():
         print("BENCH", json.dumps(brief), flush=True)
 
     broken = set()
+    # Direct only takes the DSH Node main process out of PRoot; the app's tools (apt, git,
+    # pnpm under `dsh plugin` from a terminal) still run through PRoot, so it only joins startup.
+    tools_only = [m for m in modes if m.name != "direct"]
+    plugin_add = ("dsh plugin --profile web add dsh-git-badge@0.20.1 > /tmp/bench/plugin-add.log 2>&1"
+                  " || { tail -20 /tmp/bench/plugin-add.log; exit 1; }")
+    plugin_remove = "dsh plugin --profile web remove dsh-git-badge > /tmp/bench/plugin-remove.log 2>&1"
     # Round 0: warm-up (first DSH start initialises its home; pnpm's first add is online).
     for mode in modes:
         if "startup" in suites:
             record("startup-warmup", 0, startup_once(mode, env, command, logs))
+        if mode.name == "direct":
+            continue
+        if "plugin" in suites:
+            row = run_guest(mode, env, plugin_add)
+            row["mode"] = mode.name
+            record("plugin-warmup", 0, row)
+            run_guest(mode, env, plugin_remove)
         if "pnpm" in suites:
             row = run_guest(mode, env, "command -v pnpm; mkdir -p /root/pb && cd /root/pb && printf '{}' > package.json"
                             " && pnpm add dsh-git-badge@0.20.1")
@@ -381,6 +432,15 @@ def main():
         for mode in rotate(modes, rnd - 1):
             if "startup" in suites:
                 record("startup", rnd, startup_once(mode, env, command, logs))
+            if mode.name == "direct":
+                continue
+            if "plugin" in suites:
+                row = run_guest(mode, env, plugin_add)
+                row["mode"] = mode.name
+                record("plugin", rnd, row)
+                clean = run_guest(mode, env, plugin_remove)
+                if not clean["ok"]:
+                    record("plugin-remove-failed", rnd, dict(clean, mode=mode.name))
             if "ctrlc" in suites and rnd <= 3:
                 row = ctrl_c_once(mode, env)
                 record("ctrlc", rnd, row)
@@ -404,7 +464,7 @@ def main():
     summary = {}
     for suite, metrics in (("startup", ("spawnToNodeMs", "nodeToListenMs", "nodeToTokenLineMs", "spawnToTokenMs",
                                         "tokenToFirstResponseMs", "totalMs", "stopMs")),
-                           ("pnpm", ("ms",)), ("apt", ("ms",)), ("git", ("ms",))):
+                           ("plugin", ("ms",)), ("pnpm", ("ms",)), ("apt", ("ms",)), ("git", ("ms",))):
         for mode in modes:
             rows = [r for r in results["rows"] if r["suite"] == suite and r["mode"] == mode.name]
             good = [r for r in rows if r.get("ok")]
