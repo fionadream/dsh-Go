@@ -1,0 +1,1105 @@
+--- a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/LogRedactor.kt
++++ b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/LogRedactor.kt
+@@ -50,7 +50,7 @@
+         private val ANSI = Regex("""\x1B\[[0-9;?]*[ -/]*[@-~]""")
+         private val KEY_BEGIN = Regex("""-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----""")
+         private val KEY_END = Regex("""-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----""")
+-        private val KEY_BLOCK = Regex("""${KEY_BEGIN.pattern}[\s\S]*?(?:${KEY_END.pattern}|$)""")
++        private val KEY_BLOCK = Regex("""${KEY_BEGIN.pattern}[\s\S]*?(?:${KEY_END.pattern}|\z)""")
+         private val ADDRESS = Regex("""(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]{1,15}://[^${SPACE}/:@?#]{0,256}:([^${SPACE}/@?#]+)@""")
+         // Different run classes can overlap; scan each before merging the ranges.
+         private val PROVIDERS = listOf(
+@@ -74,14 +74,19 @@
+         )
+         private val TOKEN = Regex("token=[A-Za-z0-9._~%-]+")
+         private val AUTH = Regex("""(?<![A-Za-z0-9_])(Bearer|Basic)[$SPACE]+(?!•)[A-Za-z0-9._~+/=-]+""", RegexOption.IGNORE_CASE)
+-        private val AUTH_SCHEME = Regex("""^(?:Bearer|Basic)(?![A-Za-z0-9_])""", RegexOption.IGNORE_CASE)
++        private val AUTH_SCHEME = Regex("""^(?:Bearer|Basic)$""", RegexOption.IGNORE_CASE)
+         private val MASKED_AUTH = Regex("""^(?:Bearer|Basic)[$SPACE]+•••$""", RegexOption.IGNORE_CASE)
+-        private val SECRET_NAME = Regex(
+-            """(?<![A-Za-z0-9_])[A-Za-z0-9_.-]*(?:passw(?:or)?d|passphrase|secret|credential|cookie|authorization)[A-Za-z0-9_.-]*"?[$SPACE]*[:=][$SPACE]*""",
++        private val INLINE_SPACE = SPACE.filterNot { it == '\r' || it == '\n' }
++        private val ASSIGNMENT = Regex(
++            """(?<![A-Za-z0-9_])([A-Za-z0-9_.-]*(?:passw(?:or)?d|passphrase|secret|credential|cookie|authorization|api[_-]?key|apikey|access[_-]?key|private[_-]?key|token)[A-Za-z0-9_.-]*)("?[$INLINE_SPACE]*[:=])""",
+             RegexOption.IGNORE_CASE,
+         )
+-        private val KEY_ASSIGNMENT = Regex(
+-            """(?<![A-Za-z0-9_])([A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?key|private[_-]?key|token)[A-Za-z0-9_.-]*)("?[$SPACE]*[:=][$SPACE]*["']?)(?!•)(?![0-9]+(?:[${SPACE}"',;&]|$))([^${SPACE}"',;&]{8,})""",
++        private val NEXT_ASSIGNMENT = Regex("""[A-Za-z0-9_.-]+"?[$INLINE_SPACE]*(?:=|:(?=[$INLINE_SPACE]))""")
++        private val SECRET_NAME = Regex("""passw(?:or)?d|passphrase|secret|credential|cookie|authorization""", RegexOption.IGNORE_CASE)
++        // Explicit credential names do not use value length or numeric content as a proxy.
++        // The older broad match still handles long values, but leaves counts/flags alone.
++        private val CREDENTIAL_KEY = Regex(
++            """(?:.*[_.-])?(?:api[_-]?key|access[_-]?key|private[_-]?key|token)|(?:api|access|refresh|auth|bearer|session|id)[_-]?token""",
+             RegexOption.IGNORE_CASE,
+         )
+ 
+@@ -120,23 +125,32 @@
+             }
+             text = TOKEN.replace(text, "token=$MARK")
+             text = AUTH.replace(text) { "${it.groupValues[1]} $MARK" }
+-            text = secretAssignments(text)
+-            return KEY_ASSIGNMENT.replace(text) { "${it.groupValues[1]}${it.groupValues[2]}$MARK" }
++            return assignments(text)
+         }
+ 
+         // Keep quoted values, including a value cut before its closing quote, in one mask.
+         // The linear scan also avoids a repeated regex group's host-JVM recursion.
+-        private fun secretAssignments(text: String): String {
++        private fun assignments(text: String): String {
+             val out = StringBuilder()
+             var copied = 0
+             var cursor = 0
+             while (true) {
+-                val name = SECRET_NAME.find(text, cursor) ?: break
+-                val start = name.range.last + 1
++                val match = ASSIGNMENT.find(text, cursor) ?: break
++                val name = match.groupValues[1]
++                val start = match.range.last + 1
+                 var at = start
+-                val quote = text.getOrNull(at)?.takeIf { it == '\'' || it == '"' }
++                while (at < text.length && text[at] in INLINE_SPACE) at++
++                val cookieHeader = (name.equals("cookie", true) || name.equals("set-cookie", true)) &&
++                    match.groupValues[2].endsWith(':') && !match.groupValues[2].startsWith('"')
++                // An empty assignment must not eat the next field or cross a log line.
++                if (!cookieHeader && at > start && assignmentAt(text, at)) {
++                    cursor = at
++                    continue
++                }
++                val quote = text.getOrNull(at)?.takeIf { !cookieHeader && (it == '\'' || it == '"') }
++                if (quote != null) at++
++                val valueStart = at
+                 if (quote != null) {
+-                    at++
+                     while (at < text.length && text[at] != quote && text[at] != '\r' && text[at] != '\n') {
+                         if (text[at] == '\\') {
+                             if (at + 1 == text.length || text[at + 1] == '\r' || text[at + 1] == '\n') {
+@@ -147,33 +161,51 @@
+                         }
+                         at++
+                     }
+-                    val value = text.substring(start + 1, at)
+-                    out.append(text, copied, start + 1)
+-                    out.append(if (value.isEmpty() || MASKED_AUTH.matches(value)) value else MARK)
+-                    if (at < text.length && text[at] == quote) out.append(text[at++])
+-                    copied = at
+-                    cursor = copied
+-                    continue
+-                }
+-                val valueStart = start
+-                at = valueStart
+-                while (at < text.length && text[at] !in SPACE && text[at] !in "\"',;&") at++
++                } else if (cookieHeader) {
++                    while (at < text.length && text[at] != '\r' && text[at] != '\n') at++
++                } else {
++                    val jsonValue = text.getOrNull(match.range.first - 1) == '"' &&
++                        match.groupValues[2].startsWith('"') && match.groupValues[2].endsWith(':')
++                    while (at < text.length && text[at] !in SPACE && text[at] !in "\"',;&" &&
++                        (!jsonValue || text[at] !in "}]")) at++
++                    val markedEnd = maskedEnd(text, valueStart)
++                    if (markedEnd > valueStart && assignmentAt(text, markedEnd)) {
++                        at = markedEnd
++                    }
++                }
+                 val value = text.substring(valueStart, at)
+-                if (value.isNotEmpty() && !value.startsWith('•') &&
+-                    !AUTH_SCHEME.containsMatchIn(value)) {
++                val secret = SECRET_NAME.containsMatchIn(name)
++                val authorization = name.endsWith("authorization", true)
++                val alreadyMasked = value == MARK || (!secret && maskedEnd(value, 0) == value.length) ||
++                    (authorization && (MASKED_AUTH.matches(value) || (quote == null && AUTH_SCHEME.matches(value))))
++                if (value.isNotEmpty() && !alreadyMasked &&
++                    (secret || CREDENTIAL_KEY.matches(name) || (value.length >= 8 && value.any { it !in '0'..'9' }))) {
+                     out.append(text, copied, valueStart).append(MARK)
+                     copied = at
+                 }
+-                cursor = maxOf(at, start)
++                cursor = if (quote != null && text.getOrNull(at) == quote) at + 1 else at
+             }
+             return out.append(text, copied, text.length).toString()
++        }
++
++        // A generic URI scheme is a value, not an empty field followed by an assignment.
++        private fun assignmentAt(text: String, start: Int): Boolean =
++            NEXT_ASSIGNMENT.find(text, start)?.range?.first == start ||
++                ASSIGNMENT.find(text, start)?.range?.first == start
++
++        private fun maskedEnd(text: String, start: Int): Int {
++            if (text.startsWith(MARK, start)) return start + MARK.length
++            val prefix = PREFIXES.firstOrNull { text.startsWith(it + MARK, start) } ?: return start
++            return start + prefix.length + MARK.length
+         }
+ 
+         private fun mask(value: String): String {
+             if (value.startsWith("-----BEGIN")) {
++                val begin = KEY_BEGIN.find(value)?.value ?: return MARK
++                if (value == begin) return begin
+                 if (!value.contains('\n')) return MARK
+                 val end = KEY_END.find(value)?.value
+-                return KEY_BEGIN.find(value)!!.value + "\n$MARK" + (end?.let { "\n$it" } ?: "")
++                return begin + "\n$MARK" + (end?.let { "\n$it" } ?: "")
+             }
+             return (PREFIXES.firstOrNull { value.startsWith(it) } ?: "") + MARK
+         }
+--- a/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/RuntimeLogsTest.kt
++++ b/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/RuntimeLogsTest.kt
+@@ -72,7 +72,7 @@
+         f.flush(); f.drainMain()
+         assertEquals(raw, f.logs.recent(10))
+         assertEquals(raw, f.delivered.map { it.line })
+-        assertEquals(listOf("•••", "•••", end, "done"), f.saved())
++        assertEquals(listOf(begin, "•••", end, "done"), f.saved())
+     }
+ 
+     @Test fun concurrentAdmissionHasOneOrderAndSnapshotCutoff() = Fixture().use { f ->
+--- a/app/lib/diagnostics/redact.dart
++++ b/app/lib/diagnostics/redact.dart
+@@ -16,22 +16,30 @@
+ 
+ /// `Authorization: Bearer <credential>` (and `Basic`).
+ final _bearer = RegExp(r'\b(Bearer|Basic)\s+(?!•)[A-Za-z0-9._~+/=-]+', caseSensitive: false);
++final _authorizationScheme = RegExp(r'^(?:Bearer|Basic)$', caseSensitive: false);
+ final _maskedAuthorization = RegExp(r'^(?:Bearer|Basic)\s+•••$', caseSensitive: false);
+ 
+-/// Assignments whose value is a secret whatever it looks like:
+-/// `password=…`, `"secret": "…"`, `Cookie: …`, `Authorization: Basic …`.
+-final _secretAssignment = RegExp(
+-  r'''\b([A-Za-z0-9_.-]*(?:passw(?:or)?d|passphrase|secret|credential|cookie|authorization)[A-Za-z0-9_.-]*)("?\s*[:=]\s*)(?:(["'])((?:\\[^\r\n]|(?!\3)[^\\\r\n])*(?:\\(?=[\r\n]|$))?)(\3|(?=[\r\n]|$))|(?!•)(?!(?:Bearer|Basic)\b)([^\s"',;&]+))''',
++// ECMAScript whitespace, shared with the Kotlin scanner.
++const _space =
++    '\u0009\u000A\u000B\u000C\u000D\u0020\u00A0\u1680'
++    '\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A'
++    '\u2028\u2029\u202F\u205F\u3000\uFEFF';
++final _inlineSpace = _space.replaceAll('\r', '').replaceAll('\n', '');
++
++final _assignment = RegExp(
++  r'''(?<![A-Za-z0-9_])([A-Za-z0-9_.-]*(?:passw(?:or)?d|passphrase|secret|credential|cookie|authorization|api[_-]?key|apikey|access[_-]?key|private[_-]?key|token)[A-Za-z0-9_.-]*)("?[^\S\r\n]*[:=])''',
+   caseSensitive: false,
+ );
+-
+-/// Assignments of key- or token-named values that look like one (8+
+-/// characters, not a plain number): `DEEPSEEK_API_KEY=…`, `"apiKey": "…"`,
+-/// `access_token=…`; `tokens: 1234` stays.
+-final _keyAssignment = RegExp(
+-  r'''\b([A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?key|private[_-]?key|token)[A-Za-z0-9_.-]*)("?\s*[:=]\s*["']?)(?!•)(?![0-9]+(?:[\s"',;&]|$))([^\s"',;&]{8,})''',
++final _nextAssignment = RegExp(r'''[A-Za-z0-9_.-]+"?[^\S\r\n]*(?:=|:(?=[^\S\r\n]))''');
++final _secretName = RegExp(r'passw(?:or)?d|passphrase|secret|credential|cookie|authorization', caseSensitive: false);
++// Explicit credential names do not use value length or numeric content as a proxy.
++// The older broad match still handles long values, but leaves counts/flags alone.
++final _credentialKey = RegExp(
++  r'^(?:(?:.*[_.-])?(?:api[_-]?key|access[_-]?key|private[_-]?key|token)|(?:api|access|refresh|auth|bearer|session|id)[_-]?token)$',
+   caseSensitive: false,
+ );
++final _privateKeyBegin = RegExp(r'-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----');
++final _privateKeyEnd = RegExp(r'-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----');
+ 
+ /// Known credential prefixes kept in front of the mark, so a reader still
+ /// sees which kind of key was there (`sk-•••`).
+@@ -110,16 +118,97 @@
+   }
+   out = out.replaceAll(_launchToken, 'token=$redactionMark');
+   out = out.replaceAllMapped(_bearer, (m) => '${m[1]} $redactionMark');
+-  out = out.replaceAllMapped(_secretAssignment, (m) {
+-    final quote = m[3];
+-    if (quote == null) return '${m[1]}${m[2]}$redactionMark';
+-    final value = m[4]!;
+-    // A quoted value may lose its closing quote at the line limit.
+-    final masked = value.isEmpty || _maskedAuthorization.hasMatch(value) ? value : redactionMark;
+-    return '${m[1]}${m[2]}$quote$masked${m[5]}';
+-  });
+-  out = out.replaceAllMapped(_keyAssignment, (m) => '${m[1]}${m[2]}$redactionMark');
+-  return out;
++  return _redactAssignments(out);
++}
++
++// Keep quoted values, including a value cut before its closing quote, in one mask.
++String _redactAssignments(String text) {
++  final out = StringBuffer();
++  var copied = 0;
++  var cursor = 0;
++  while (true) {
++    final match = _assignment.allMatches(text, cursor).firstOrNull;
++    if (match == null) break;
++    final name = match[1]!;
++    final start = match.end;
++    var at = start;
++    while (at < text.length && _inlineSpace.contains(text[at])) {
++      at++;
++    }
++    final cookieHeader =
++        (name.toLowerCase() == 'cookie' || name.toLowerCase() == 'set-cookie') &&
++        match[2]!.endsWith(':') &&
++        !match[2]!.startsWith('"');
++    // An empty assignment must not eat the next field or cross a log line.
++    if (!cookieHeader && at > start && _assignmentAt(text, at)) {
++      cursor = at;
++      continue;
++    }
++    final quote = !cookieHeader && at < text.length && (text[at] == "'" || text[at] == '"') ? text[at] : null;
++    if (quote != null) at++;
++    final valueStart = at;
++    if (quote != null) {
++      while (at < text.length && text[at] != quote && text[at] != '\r' && text[at] != '\n') {
++        if (text[at] == r'\') {
++          if (at + 1 == text.length || text[at + 1] == '\r' || text[at + 1] == '\n') {
++            at++;
++            break;
++          }
++          at++;
++        }
++        at++;
++      }
++    } else if (cookieHeader) {
++      while (at < text.length && text[at] != '\r' && text[at] != '\n') {
++        at++;
++      }
++    } else {
++      final jsonValue =
++          match.start > 0 && text[match.start - 1] == '"' && match[2]!.startsWith('"') && match[2]!.endsWith(':');
++      while (at < text.length &&
++          !_space.contains(text[at]) &&
++          !"\"',;&".contains(text[at]) &&
++          (!jsonValue || !'}]'.contains(text[at]))) {
++        at++;
++      }
++      final markedEnd = _maskedEnd(text, valueStart);
++      if (markedEnd > valueStart && _assignmentAt(text, markedEnd)) {
++        at = markedEnd;
++      }
++    }
++    final value = text.substring(valueStart, at);
++    final secret = _secretName.hasMatch(name);
++    final authorization = name.toLowerCase().endsWith('authorization');
++    final alreadyMasked =
++        value == redactionMark ||
++        (!secret && _maskedEnd(value, 0) == value.length) ||
++        (authorization &&
++            (_maskedAuthorization.hasMatch(value) || (quote == null && _authorizationScheme.hasMatch(value))));
++    if (value.isNotEmpty &&
++        !alreadyMasked &&
++        (secret ||
++            _credentialKey.hasMatch(name) ||
++            (value.length >= 8 && value.codeUnits.any((unit) => unit < 0x30 || unit > 0x39)))) {
++      out
++        ..write(text.substring(copied, valueStart))
++        ..write(redactionMark);
++      copied = at;
++    }
++    cursor = quote != null && at < text.length && text[at] == quote ? at + 1 : at;
++  }
++  return (out..write(text.substring(copied))).toString();
++}
++
++// A generic URI scheme is a value, not an empty field followed by an assignment.
++bool _assignmentAt(String text, int start) =>
++    _nextAssignment.matchAsPrefix(text, start) != null || _assignment.matchAsPrefix(text, start) != null;
++
++int _maskedEnd(String text, int start) {
++  if (text.startsWith(redactionMark, start)) return start + redactionMark.length;
++  for (final prefix in _prefixes) {
++    if (text.startsWith('$prefix$redactionMark', start)) return start + prefix.length + redactionMark.length;
++  }
++  return start;
+ }
+ 
+ /// Redacts the log together so private-key blocks retain their line context.
+@@ -140,10 +229,12 @@
+ 
+ String _maskSpan(String secret) {
+   if (secret.startsWith('-----BEGIN')) {
+-    final lines = secret.split('\n');
+-    if (lines.length < 2) return redactionMark;
+-    final hasEnd = lines.last.startsWith('-----END ') && lines.last.endsWith('PRIVATE KEY-----');
+-    return '${lines.first}\n$redactionMark${hasEnd ? '\n${lines.last}' : ''}';
++    final begin = _privateKeyBegin.firstMatch(secret)?[0];
++    if (begin == null) return redactionMark;
++    if (secret == begin) return begin;
++    if (!secret.contains('\n')) return redactionMark;
++    final end = _privateKeyEnd.firstMatch(secret)?[0];
++    return '$begin\n$redactionMark${end == null ? '' : '\n$end'}';
+   }
+   for (final prefix in _prefixes) {
+     if (secret.startsWith(prefix)) return '$prefix$redactionMark';
+--- a/app/test/diagnostics/redact_test.dart
++++ b/app/test/diagnostics/redact_test.dart
+@@ -72,7 +72,7 @@
+ 
+     test('passwords, cookies and authorization of any length', () {
+       expect(redactDiagnostics('password=hunter2'), 'password=•••');
+-      expect(redactDiagnostics('Cookie: dsh_session=s%3Aabc.def; Path=/'), 'Cookie: •••; Path=/');
++      expect(redactDiagnostics('Cookie: dsh_session=s%3Aabc.def; Path=/'), 'Cookie: •••');
+       expect(redactDiagnostics('Authorization: Bearer abcdef123456'), 'Authorization: Bearer •••');
+       expect(redactDiagnostics('authorization: Basic dXNlcjpwYXNz'), 'authorization: Basic •••');
+     });
+--- a/tooling/fixtures/diagnostic-redaction.json
++++ b/tooling/fixtures/diagnostic-redaction.json
+@@ -625,8 +625,7 @@
+       ],
+       "expectedParts": [
+         "Cookie: ",
+-        "•••; Pat",
+-        "h=/"
++        "•••"
+       ]
+     },
+     {
+@@ -2410,6 +2409,759 @@
+         "=\"•••\nor",
+         "dinary"
+       ]
++    },
++    {
++      "name": "explicit short API key",
++      "inputParts": [
++        "API_KEY=",
++        "x"
++      ],
++      "expectedParts": [
++        "API_KEY=",
++        "•••"
++      ]
++    },
++    {
++      "name": "explicit numeric JSON API key",
++      "inputParts": [
++        "{\"apiKey",
++        "\": \"1234",
++        "\"}"
++      ],
++      "expectedParts": [
++        "{\"apiKey",
++        "\": \"•••\"",
++        "}"
++      ]
++    },
++    {
++      "name": "explicit numeric access key",
++      "inputParts": [
++        "access_k",
++        "ey=12"
++      ],
++      "expectedParts": [
++        "access_k",
++        "ey=•••"
++      ]
++    },
++    {
++      "name": "explicit short environment token",
++      "inputParts": [
++        "GITHUB_T",
++        "OKEN=ab"
++      ],
++      "expectedParts": [
++        "GITHUB_T",
++        "OKEN=•••"
++      ]
++    },
++    {
++      "name": "explicit numeric camel refresh token",
++      "inputParts": [
++        "refreshT",
++        "oken=7"
++      ],
++      "expectedParts": [
++        "refreshT",
++        "oken=•••"
++      ]
++    },
++    {
++      "name": "key and token counts and flags",
++      "inputParts": [
++        "tokens=1",
++        "23456789",
++        " max_tok",
++        "ens=8192",
++        " input_t",
++        "okens=7 ",
++        "token_co",
++        "unt=1234",
++        "56789 ha",
++        "sApiKey=",
++        "true"
++      ],
++      "expectedParts": [
++        "tokens=1",
++        "23456789",
++        " max_tok",
++        "ens=8192",
++        " input_t",
++        "okens=7 ",
++        "token_co",
++        "unt=1234",
++        "56789 ha",
++        "sApiKey=",
++        "true"
++      ]
++    },
++    {
++      "name": "quoted API key phrase",
++      "inputParts": [
++        "{\"apiKey",
++        "\":\"synth",
++        "etic phr",
++        "ase; wit",
++        "h, punct",
++        "uation&t",
++        "ail\",\"at",
++        "tempt\":2",
++        "}"
++      ],
++      "expectedParts": [
++        "{\"apiKey",
++        "\":\"•••\",",
++        "\"attempt",
++        "\":2}"
++      ]
++    },
++    {
++      "name": "quoted API key escaped quotes",
++      "inputParts": [
++        "{\"apiKey",
++        "\":\"synth",
++        "etic\\\"qu",
++        "oted\\\" t",
++        "ail\",\"at",
++        "tempt\":2",
++        "}"
++      ],
++      "expectedParts": [
++        "{\"apiKey",
++        "\":\"•••\",",
++        "\"attempt",
++        "\":2}"
++      ]
++    },
++    {
++      "name": "unfinished quoted API key dangling escape",
++      "inputParts": [
++        "api_key=",
++        "'synthet",
++        "ic phras",
++        "e\\"
++      ],
++      "expectedParts": [
++        "api_key=",
++        "'•••"
++      ]
++    },
++    {
++      "name": "unfinished quoted token stops at newline",
++      "inputParts": [
++        "access_t",
++        "oken=\"sy",
++        "nthetic ",
++        "phrase\\\n",
++        "ordinary"
++      ],
++      "expectedParts": [
++        "access_t",
++        "oken=\"••",
++        "•\nordina",
++        "ry"
++      ]
++    },
++    {
++      "name": "inline environment credential assignments",
++      "inputParts": [
++        "env FOO=",
++        "normal A",
++        "PI_KEY='",
++        "syntheti",
++        "c phrase",
++        "' REFRES",
++        "H_TOKEN=",
++        "7 comman",
++        "d"
++      ],
++      "expectedParts": [
++        "env FOO=",
++        "normal A",
++        "PI_KEY='",
++        "•••' REF",
++        "RESH_TOK",
++        "EN=••• c",
++        "ommand"
++      ]
++    },
++    {
++      "name": "password equal to Basic",
++      "inputParts": [
++        "password",
++        "=Basic"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••"
++      ]
++    },
++    {
++      "name": "password with Bearer prefix",
++      "inputParts": [
++        "password",
++        "=Bearer-",
++        "syntheti",
++        "c"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••"
++      ]
++    },
++    {
++      "name": "quoted secret with authorization scheme",
++      "inputParts": [
++        "secret=\"",
++        "Basic sy",
++        "nthetic ",
++        "phrase\""
++      ],
++      "expectedParts": [
++        "secret=\"",
++        "•••\""
++      ]
++    },
++    {
++      "name": "quoted password with already masked authorization",
++      "inputParts": [
++        "password",
++        "=\"Bearer",
++        " •••\""
++      ],
++      "expectedParts": [
++        "password",
++        "=\"•••\""
++      ]
++    },
++    {
++      "name": "empty password before token assignment",
++      "inputParts": [
++        "password",
++        "= token=",
++        "'synthet",
++        "ic phras",
++        "e'"
++      ],
++      "expectedParts": [
++        "password",
++        "= token=",
++        "'•••'"
++      ]
++    },
++    {
++      "name": "empty API key before ordinary assignment",
++      "inputParts": [
++        "API_KEY=",
++        " status=",
++        "ready"
++      ],
++      "expectedParts": [
++        "API_KEY=",
++        " status=",
++        "ready"
++      ]
++    },
++    {
++      "name": "empty secret before next line",
++      "inputParts": [
++        "secret=\n",
++        "password",
++        "=abc"
++      ],
++      "expectedParts": [
++        "secret=\n",
++        "password",
++        "=•••"
++      ]
++    },
++    {
++      "name": "empty password preserves inline whitespace",
++      "inputParts": [
++        "password",
++        "= \tAPI_K",
++        "EY=x"
++      ],
++      "expectedParts": [
++        "password",
++        "= \tAPI_K",
++        "EY=•••"
++      ]
++    },
++    {
++      "name": "empty quoted key stays empty",
++      "inputParts": [
++        "API_KEY=",
++        "'' token",
++        "_count=0"
++      ],
++      "expectedParts": [
++        "API_KEY=",
++        "'' token",
++        "_count=0"
++      ]
++    },
++    {
++      "name": "Cookie header masks every cookie",
++      "inputParts": [
++        "Cookie: ",
++        "first=on",
++        "e; secon",
++        "d=two"
++      ],
++      "expectedParts": [
++        "Cookie: ",
++        "•••"
++      ]
++    },
++    {
++      "name": "Set-Cookie header masks whole value",
++      "inputParts": [
++        "Set-Cook",
++        "ie: firs",
++        "t=one; P",
++        "ath=/; H",
++        "ttpOnly"
++      ],
++      "expectedParts": [
++        "Set-Cook",
++        "ie: •••"
++      ]
++    },
++    {
++      "name": "Cookie header stops at newline",
++      "inputParts": [
++        "Cookie: ",
++        "first=on",
++        "e; secon",
++        "d=two\nX-",
++        "Count: 2"
++      ],
++      "expectedParts": [
++        "Cookie: ",
++        "•••\nX-Co",
++        "unt: 2"
++      ]
++    },
++    {
++      "name": "quoted JSON Cookie value",
++      "inputParts": [
++        "{\"Cookie",
++        "\": \"firs",
++        "t=one; s",
++        "econd=tw",
++        "o\", \"att",
++        "empt\":2}"
++      ],
++      "expectedParts": [
++        "{\"Cookie",
++        "\": \"•••\"",
++        ", \"attem",
++        "pt\":2}"
++      ]
++    },
++    {
++      "name": "masked value directly before another secret",
++      "inputParts": [
++        "password",
++        "=•••secr",
++        "et=abc"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••secr",
++        "et=•••"
++      ]
++    },
++    {
++      "name": "masked value directly before another key",
++      "inputParts": [
++        "password",
++        "=•••API_",
++        "KEY=x"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••API_",
++        "KEY=•••"
++      ]
++    },
++    {
++      "name": "masked prefix does not exempt a readable suffix",
++      "inputParts": [
++        "password",
++        "=•••synt",
++        "hetic"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••"
++      ]
++    },
++    {
++      "name": "masked provider directly before another assignment",
++      "inputParts": [
++        "api_key=",
++        "sk-•••pa",
++        "ssword=a",
++        "bc"
++      ],
++      "expectedParts": [
++        "api_key=",
++        "sk-•••pa",
++        "ssword=•",
++        "••"
++      ]
++    },
++    {
++      "name": "quoted masked prefix remains inside the credential",
++      "inputParts": [
++        "password",
++        "=\"•••sec",
++        "ret=abc\""
++      ],
++      "expectedParts": [
++        "password",
++        "=\"•••\""
++      ]
++    },
++    {
++      "name": "quoted key encloses another credential assignment",
++      "inputParts": [
++        "apiKey=\"",
++        "password",
++        "='synthe",
++        "tic valu",
++        "e' tail\""
++      ],
++      "expectedParts": [
++        "apiKey=\"",
++        "•••\""
++      ]
++    },
++    {
++      "name": "numeric JSON key preserves closing punctuation",
++      "inputParts": [
++        "{\"apiKey",
++        "\":1234}"
++      ],
++      "expectedParts": [
++        "{\"apiKey",
++        "\":•••}"
++      ]
++    },
++    {
++      "name": "private key standalone header",
++      "inputParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "---"
++      ],
++      "expectedParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "---"
++      ]
++    },
++    {
++      "name": "private key standalone header with log prefix",
++      "inputParts": [
++        "before -",
++        "----BEGI",
++        "N PRIVAT",
++        "E KEY---",
++        "--"
++      ],
++      "expectedParts": [
++        "before -",
++        "----BEGI",
++        "N PRIVAT",
++        "E KEY---",
++        "--"
++      ]
++    },
++    {
++      "name": "private key unfinished final newline",
++      "inputParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "---\n"
++      ],
++      "expectedParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "---\n•••"
++      ]
++    },
++    {
++      "name": "private key inline header payload is not retained",
++      "inputParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "--- SYNT",
++        "HETIC\nSY",
++        "NTHETIC-",
++        "TAIL"
++      ],
++      "expectedParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "---\n•••"
++      ]
++    },
++    {
++      "name": "private key end after same-line body",
++      "inputParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "---\nSYNT",
++        "HETIC --",
++        "---END P",
++        "RIVATE K",
++        "EY-----"
++      ],
++      "expectedParts": [
++        "-----BEG",
++        "IN PRIVA",
++        "TE KEY--",
++        "---\n•••\n",
++        "-----END",
++        " PRIVATE",
++        " KEY----",
++        "-"
++      ]
++    },
++    {
++      "name": "overlap three provider ranges",
++      "inputParts": [
++        "AIza-xox",
++        "b-SYNTHE",
++        "TIC3-git",
++        "hub_pat_",
++        "SYNTHETI",
++        "C3SYNTHE",
++        "TIC3SYNT",
++        "HETIC3SY",
++        "NTHETIC3"
++      ],
++      "expectedParts": [
++        "AIza•••"
++      ]
++    },
++    {
++      "name": "overlap URL and provider chain",
++      "inputParts": [
++        "https://",
++        "u:AIza-s",
++        "k-SYNTHE",
++        "TIC3SYNT",
++        "HETIC3SY",
++        "NTHETIC3",
++        "SYNTHETI",
++        "C3SYNTHE",
++        "TIC3SYNT",
++        "HETIC3@e",
++        "xample.i",
++        "nvalid/"
++      ],
++      "expectedParts": [
++        "https://",
++        "u:AIza••",
++        "•@exampl",
++        "e.invali",
++        "d/"
++      ]
++    },
++    {
++      "name": "overlap provider and private key block",
++      "inputParts": [
++        "sk-3----",
++        "--------",
++        "--------",
++        "--------",
++        "-BEGIN P",
++        "RIVATE K",
++        "EY-----\n",
++        "SYNTHETI",
++        "C\n-----E",
++        "ND PRIVA",
++        "TE KEY--",
++        "---"
++      ],
++      "expectedParts": [
++        "sk-•••"
++      ]
++    },
++    {
++      "name": "Cookie header starting with a quoted value",
++      "inputParts": [
++        "Cookie: ",
++        "\"first=o",
++        "ne\"; sec",
++        "ond=two"
++      ],
++      "expectedParts": [
++        "Cookie: ",
++        "•••"
++      ]
++    },
++    {
++      "name": "overlapping secret assignments with a scheme prefix",
++      "inputParts": [
++        "password",
++        "=Bearer-",
++        "secret=s",
++        "ynthetic"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••"
++      ]
++    },
++    {
++      "name": "URL password with a non-PEM BEGIN prefix",
++      "inputParts": [
++        "https://",
++        "u:-----B",
++        "EGIN-SYN",
++        "THETIC@e",
++        "xample.i",
++        "nvalid/"
++      ],
++      "expectedParts": [
++        "https://",
++        "u:•••@ex",
++        "ample.in",
++        "valid/"
++      ]
++    },
++    {
++      "name": "unquoted password includes a closing bracket",
++      "inputParts": [
++        "password",
++        "=synthet",
++        "ic]tail"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••"
++      ]
++    },
++    {
++      "name": "unquoted API key includes a closing brace",
++      "inputParts": [
++        "API_KEY=",
++        "syntheti",
++        "c}tail"
++      ],
++      "expectedParts": [
++        "API_KEY=",
++        "•••"
++      ]
++    },
++    {
++      "name": "quoted environment key still allows closing brace",
++      "inputParts": [
++        "\"API_KEY",
++        "\"=synthe",
++        "tic}tail"
++      ],
++      "expectedParts": [
++        "\"API_KEY",
++        "\"=•••"
++      ]
++    },
++    {
++      "name": "password URL value after separator whitespace",
++      "inputParts": [
++        "password",
++        "= https:",
++        "//exampl",
++        "e.invali",
++        "d/synthe",
++        "tic"
++      ],
++      "expectedParts": [
++        "password",
++        "= •••"
++      ]
++    },
++    {
++      "name": "API key URL value after separator whitespace",
++      "inputParts": [
++        "API_KEY=",
++        " https:/",
++        "/example",
++        ".invalid",
++        "/synthet",
++        "ic"
++      ],
++      "expectedParts": [
++        "API_KEY=",
++        " •••"
++      ]
++    },
++    {
++      "name": "secret opaque URI after separator whitespace",
++      "inputParts": [
++        "secret= ",
++        "urn:synt",
++        "hetic"
++      ],
++      "expectedParts": [
++        "secret= ",
++        "•••"
++      ]
++    },
++    {
++      "name": "empty password before sensitive colon assignment",
++      "inputParts": [
++        "password",
++        "= secret",
++        ":synthet",
++        "ic"
++      ],
++      "expectedParts": [
++        "password",
++        "= secret",
++        ":•••"
++      ]
++    },
++    {
++      "name": "empty API key before ordinary colon field",
++      "inputParts": [
++        "API_KEY=",
++        " status:",
++        " ready"
++      ],
++      "expectedParts": [
++        "API_KEY=",
++        " status:",
++        " ready"
++      ]
++    },
++    {
++      "name": "masked password followed immediately by a URI",
++      "inputParts": [
++        "password",
++        "=•••http",
++        "s://exam",
++        "ple.inva",
++        "lid/synt",
++        "hetic"
++      ],
++      "expectedParts": [
++        "password",
++        "=•••"
++      ]
+     }
+   ]
+ }

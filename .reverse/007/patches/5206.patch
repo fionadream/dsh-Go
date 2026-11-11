@@ -1,0 +1,208 @@
+diff --git a/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt b/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt
+--- a/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt
++++ b/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt
+@@ -14,6 +14,7 @@
+         val root = Files.createTempDirectory(output.toPath(), "cleanup-").toFile()
+         val childRoot = if (scenario == "other-root") Files.createTempDirectory(output.toPath(), "other-").toFile() else root
+         val logs = mutableListOf<String>()
++        val startupFailures = mutableListOf<DshProcess>()
+         val child = ProcessBuilder("/bin/sleep", "30").directory(childRoot).apply {
+             environment()["DSH_GO_RUNTIME_ROOT"] = childRoot.canonicalPath
+         }.start()
+@@ -32,7 +33,7 @@
+             val runtime = DshProcess(Context(root), RuntimeManifest(), root, object : DshProcess.Listener {
+                 override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+                 override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
+-                override fun onStartupFailure(source: DshProcess) {}
++                override fun onStartupFailure(source: DshProcess) { startupFailures += source }
+                 override fun onExit(source: DshProcess, code: Int, expected: Boolean) {}
+             })
+             val clean = runtime.killStrays()
+@@ -55,6 +56,7 @@
+                 check(recovered && !child.isAlive) { "captured cleanup did not recover when observation returned" }
+             }
+             check(Os.signalledPids.all { it == pid })
++            check(startupFailures.isEmpty()) { "Cleanup-only probe received a startup failure" }
+             println("""{"case":"$scenario","reportedClean":$clean,"childAliveAfterFirst":$alive,"deniedReads":$denied,"signalsBeforeRecovery":$signals,"recovered":$recovered,"diagnosticCount":${logs.size},"pass":true}""")
+         } finally {
+             Os.denyStatPids -= pid; Os.denyOnce -= pid; Os.denyAfterSignal -= pid; Os.ignoreSignals -= pid; Os.foreignUid -= pid
+diff --git a/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt b/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt
+@@ -5,6 +5,7 @@
+ import android.system.Os
+ import java.io.File
+ import java.nio.file.Files
++import java.util.Collections
+ import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicBoolean
+@@ -25,6 +26,7 @@
+     val children = mutableListOf<Process>()
+     val attempts = mutableListOf<DshProcess>()
+     val methods = mutableListOf<Boolean>()
++    val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
+     fun child(): Process = ProcessBuilder("/bin/sleep", "45").directory(root).apply {
+         environment()["DSH_GO_RUNTIME_ROOT"] = root.canonicalPath
+     }.start().also {
+@@ -38,7 +40,7 @@
+     )), root, object : DshProcess.Listener {
+         override fun onLog(line: String, stream: String, storageLine: String) { println("[$case] $line") }
+         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
+-        override fun onStartupFailure(source: DshProcess) {}
++        override fun onStartupFailure(source: DshProcess) { startupFailures += source }
+         override fun onExit(source: DshProcess, code: Int, expected: Boolean) {}
+     }).also(attempts::add)
+     val guestRecord = DshProcess::class.java.getDeclaredMethod("guestRecord").apply { isAccessible = true }
+@@ -51,6 +53,7 @@
+         }
+         next.failStart(failure.message!!)
+         next.awaitExit()
++        check(startupFailures == listOf(next)) { "Expected one startup-failure callback from the rejected launcher" }
+         check(methods.isEmpty() && !marker.exists() && Os.sentSignals == 0)
+     }
+     var lockObserved = false
+diff --git a/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt b/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt
+@@ -35,24 +35,29 @@
+     } else Os.denyStatPids += pid
+     data class Attempt(val process: DshProcess, val logs: MutableList<String>,
+                        val methods: MutableList<Boolean>, val exits: MutableList<Int>,
++                       val startupFailures: MutableList<DshProcess>,
+                        val done: CountDownLatch)
+     fun newAttempt(): Attempt {
+         val logs = Collections.synchronizedList(mutableListOf<String>())
+         val methods = Collections.synchronizedList(mutableListOf<Boolean>())
+         val exits = Collections.synchronizedList(mutableListOf<Int>())
++        val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
+         val done = CountDownLatch(1)
+         val process = DshProcess(Context(root), RuntimeManifest(launchArgv = listOf(
+             launcher.path, "/usr/bin/env", "-i", "{GUEST_ENV}", "startup-probe-command",
+         )), root, object : DshProcess.Listener {
+             override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+             override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
+-            override fun onStartupFailure(source: DshProcess) {}
++            override fun onStartupFailure(source: DshProcess) {
++                startupFailures += source
++                done.countDown()
++            }
+             override fun onExit(source: DshProcess, code: Int, expected: Boolean) {
+                 exits += code
+                 done.countDown()
+             }
+         })
+-        return Attempt(process, logs, methods, exits, done)
++        return Attempt(process, logs, methods, exits, startupFailures, done)
+     }
+     val attempts = mutableListOf<Attempt>()
+     fun launch(attempt: Attempt): Throwable? {
+@@ -94,6 +99,9 @@
+         val secondCleanup = second.process.killStrays()
+         val errors = mutableListOf<String>()
+         fun expect(value: Boolean, message: String) { if (!value) errors += message }
++        val expectedFirstFailures = if (firstFailure == null) emptyList() else listOf(first.process)
++        expect(first.startupFailures == expectedFirstFailures, "Unexpected first startup-failure callbacks")
++        expect(second.startupFailures.isEmpty(), "Unexpected second startup-failure callback")
+         expect(sameIdentityBeforeRetry && sameIdentityAfterRetry, "Fixture process identity changed")
+         expect(!firstCleanup && !secondCleanup, "Observation failure was misreported as cleanup success")
+         if (captured) {
+diff --git a/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt b/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt
+@@ -5,6 +5,7 @@
+ import android.system.Os
+ import java.io.File
+ import java.nio.file.Files
++import java.util.Collections
+ import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.TimeUnit
+ 
+@@ -37,12 +38,16 @@
+     val methods = mutableListOf<Boolean>()
+     fun launch(directory: File): Boolean {
+         val done = CountDownLatch(1)
++        val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
+         val process = DshProcess(Context(directory), RuntimeManifest(launchArgv = listOf(
+             File(directory, "fixture-launcher").path, "/usr/bin/env", "-i", "{GUEST_ENV}", "startup-probe-command",
+         )), directory, object : DshProcess.Listener {
+             override fun onLog(line: String, stream: String, storageLine: String) { println("[$case] $line") }
+             override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
+-            override fun onStartupFailure(source: DshProcess) {}
++            override fun onStartupFailure(source: DshProcess) {
++                startupFailures += source
++                done.countDown()
++            }
+             override fun onExit(source: DshProcess, code: Int, expected: Boolean) { done.countDown() }
+         })
+         attempts += process
+@@ -57,6 +62,8 @@
+             check(done.await(12, TimeUnit.SECONDS)) { "Fixture launcher did not exit" }
+             process.awaitExit(1000)
+         }
++        val expectedFailures = if (failure == null) emptyList() else listOf(process)
++        check(startupFailures == expectedFailures) { "Unexpected startup-failure callbacks for $case" }
+         return (failure == null).also(decisions::add)
+     }
+     try {
+diff --git a/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt b/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt
+@@ -46,17 +46,24 @@
+         check(setExecutable(true, true))
+     }
+     val logs = Collections.synchronizedList(mutableListOf<String>())
++    val exits = Collections.synchronizedList(mutableListOf<Int>())
++    val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
+     val done = CountDownLatch(1)
+     val runtime = DshProcess(context, RuntimeManifest(launchArgv = listOf(launcher.path)), root, object : DshProcess.Listener {
+         override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
+-        override fun onStartupFailure(source: DshProcess) {}
+-        override fun onExit(source: DshProcess, code: Int, expected: Boolean) { check(code == 0); done.countDown() }
++        override fun onStartupFailure(source: DshProcess) {
++            startupFailures += source
++            done.countDown()
++        }
++        override fun onExit(source: DshProcess, code: Int, expected: Boolean) { exits += code; done.countDown() }
+     })
+     try {
+         runtime.start(emptyMap())
+         check(done.await(12, TimeUnit.SECONDS)) { "fixture did not exit" }
+         runtime.awaitExit(1000)
++        check(startupFailures.isEmpty()) { "Temporary-cleanup fixture reported a startup failure" }
++        check(exits == listOf(0)) { "Temporary-cleanup fixture did not exit successfully: $exits" }
+         val shouldReclaim = case == "stale"
+         check(Files.exists(stale.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) != shouldReclaim) { "incorrect stale-directory outcome for $case" }
+         check(live.isDirectory && child.isAlive) { "a live instance's directory or process was removed" }
+diff --git a/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt b/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt
+--- a/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt
++++ b/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt
+@@ -41,6 +41,7 @@
+     val logs = Collections.synchronizedList(mutableListOf<String>())
+     val methods = mutableListOf<Boolean>()
+     val exits = Collections.synchronizedList(mutableListOf<Int>())
++    val startupFailures = Collections.synchronizedList(mutableListOf<DshProcess>())
+     val done = CountDownLatch(1)
+     val child = ProcessBuilder("/bin/sleep", "45").directory(if (owned) root else other).apply {
+         if (owned) environment()["DSH_GO_RUNTIME_ROOT"] = root.canonicalPath
+@@ -58,7 +59,10 @@
+     )), root, object : DshProcess.Listener {
+         override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
+-        override fun onStartupFailure(source: DshProcess) {}
++        override fun onStartupFailure(source: DshProcess) {
++            startupFailures += source
++            done.countDown()
++        }
+         override fun onExit(source: DshProcess, code: Int, expected: Boolean) { exits += code; done.countDown() }
+     })
+     try {
+@@ -73,6 +77,7 @@
+         val cleanup = runtime.killStrays()
+         val errors = mutableListOf<String>()
+         fun expect(value: Boolean, message: String) { if (!value) errors += message }
++        expect(startupFailures.isEmpty(), "Unexpected startup-failure callback")
+         expect(runtime.executionMode == null, "an exited or rejected launch reported a current process")
+         expect(runtime.launchDiagnostics.spawned == (failure == null), "spawn fact did not match the actual fixture child")
+         expect(runtime.launchDiagnostics.selectedMode == if (case == "direct-unknown") "direct" else "proot", "selected method mismatch")

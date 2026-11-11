@@ -1,0 +1,378 @@
+diff --git a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneControl.kt b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneControl.kt
+--- a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneControl.kt
++++ b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneControl.kt
+@@ -57,6 +57,9 @@
+     private val main = Handler(Looper.getMainLooper())
+     private val nm = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+     private val ticker = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "dsh-phone-status").apply { isDaemon = true } }
++    // Switch publication remains ordered when Flutter detaches and creates another plugin.
++    internal val controlIo = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-control").apply { isDaemon = true } }
++    internal val phoneSwitch = PhoneSwitchDispatch(controlIo)
+ 
+     private val taskIds = java.util.concurrent.atomic.AtomicLong()
+     private val cleanupIo = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-cleanup").apply { isDaemon = true } }
+diff --git a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhonePlugin.kt b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhonePlugin.kt
+--- a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhonePlugin.kt
++++ b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhonePlugin.kt
+@@ -58,7 +58,7 @@
+     private var sink: ((Map<String, Any?>) -> Unit)? = null
+     private val main = Handler(Looper.getMainLooper())
+     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-plugin").apply { isDaemon = true } }
+-    private val controlIo = Executors.newSingleThreadExecutor { r -> Thread(r, "dsh-phone-control").apply { isDaemon = true } }
++    private val controlIo get() = control.controlIo
+     @Volatile private var promptOwner = Any()
+     @Volatile private var attached = false
+     @Volatile private var skillClient: PhoneSkillDrafts.Client? = null
+@@ -279,10 +279,12 @@
+                     controlIo.execute { control.background.saveKeep(cleared) }
+                     control.background.cancelRootSelection()
+                 }
+-                async(result) {
+-                    val ok = (!enabled || control.background.preparePhoneEnable()) && control.setEnabled(enabled)
+-                    if (ok && !enabled) control.background.setBackgroundMode("off")["ok"] == true else ok
+-                }
++                control.phoneSwitch.dispatch(enabled, io,
++                    prepareEnable = { control.background.preparePhoneEnable() },
++                    change = { control.setEnabled(it) },
++                    backgroundOff = { control.background.setBackgroundMode("off")["ok"] == true },
++                    complete = { complete(result, it) },
++                )
+             }
+             "openAccessibilitySettings" -> result.success(startActivity(control.accessibilitySettingsIntent()))
+             "openAppDetails" -> result.success(startActivity(control.appDetailsIntent()))
+diff --git a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneSwitchDispatch.kt b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneSwitchDispatch.kt
+new file mode 100644
+--- /dev/null
++++ b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneSwitchDispatch.kt
+@@ -0,0 +1,53 @@
++package io.github.ccch1mneyyy.dsh_app.phone
++
++import java.util.concurrent.CompletableFuture
++import java.util.concurrent.Executor
++
++/** Process-wide switch order; dispatch and io submission both run on the channel's main thread. */
++internal class PhoneSwitchDispatch(private val controlIo: Executor) {
++    private var tail = CompletableFuture.completedFuture(Unit)
++    @Volatile private var offGeneration = 0L
++
++    fun dispatch(enabled: Boolean, io: Executor, prepareEnable: () -> Boolean,
++                 change: (Boolean) -> Boolean, backgroundOff: () -> Boolean,
++                 complete: (Result<Boolean>) -> Unit) {
++        val previous = tail
++        val finished = CompletableFuture<Unit>()
++        tail = finished
++        if (!enabled) offGeneration++
++        val generation = offGeneration
++        // Off never waits for a mode operation. Its later cleanup is reserved on io now,
++        // before a subsequent method call can enqueue a new mode or an enable there.
++        val disabled = if (!enabled) changeOnControl { change(false) } else null
++        io.execute {
++            val value = try {
++                runCatching {
++                    previous.join()
++                    if (disabled != null) {
++                        disabled.join().getOrThrow() && backgroundOff()
++                    } else if (generation != offGeneration) {
++                        true // A later off superseded this queued enable.
++                    } else if (!prepareEnable()) {
++                        false
++                    } else {
++                        // All real changes use the same control lane, including after reattach.
++                        // Recheck after prepare: a newer off may have arrived while it blocked.
++                        changeOnControl {
++                            if (generation != offGeneration) true else change(true)
++                        }.join().getOrThrow()
++                    }
++                }
++            } finally {
++                // Completion is ordering, not success. Preserve false/throw in the result.
++                finished.complete(Unit)
++            }
++            complete(value)
++        }
++    }
++
++    private fun changeOnControl(change: () -> Boolean): CompletableFuture<Result<Boolean>> {
++        val changed = CompletableFuture<Result<Boolean>>()
++        controlIo.execute { changed.complete(runCatching(change)) }
++        return changed
++    }
++}
+diff --git a/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneSwitchDispatchTest.kt b/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneSwitchDispatchTest.kt
+new file mode 100644
+--- /dev/null
++++ b/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneSwitchDispatchTest.kt
+@@ -0,0 +1,141 @@
++package io.github.ccch1mneyyy.dsh_app.phone
++
++import java.util.Collections
++import java.util.concurrent.CompletableFuture
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executor
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++import org.junit.After
++import org.junit.Assert.*
++import org.junit.Test
++
++class PhoneSwitchDispatchTest {
++    private val control = Executors.newSingleThreadExecutor()
++    private val io = Executors.newSingleThreadExecutor()
++    private val nextIo = Executors.newSingleThreadExecutor()
++    private val dispatch = PhoneSwitchDispatch(control)
++    private val enabled = AtomicBoolean(true)
++    private val events = Collections.synchronizedList(mutableListOf<String>())
++
++    @After fun close() { control.shutdownNow(); io.shutdownNow(); nextIo.shutdownNow() }
++
++    private fun request(on: Boolean, lane: Executor = io, prepare: () -> Boolean = { true },
++                        cleanup: () -> Boolean = { events += "cleanup"; true }): CompletableFuture<Result<Boolean>> {
++        val result = CompletableFuture<Result<Boolean>>()
++        dispatch.dispatch(on, lane, prepare, { enabled.set(it); events += "enabled=$it"; true }, cleanup,
++            { result.complete(it) })
++        return result
++    }
++
++    private fun result(value: CompletableFuture<Result<Boolean>>) = value.get(5, TimeUnit.SECONDS).getOrThrow()
++
++    @Test fun offIsPublishedWhileModeIsBusyButOnAndFollowingModeWaitForCleanup() {
++        val entered = CountDownLatch(1); val release = CountDownLatch(1)
++        io.execute { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)); events += "old-mode" }
++        try {
++            assertTrue(entered.await(5, TimeUnit.SECONDS))
++            val off = request(false)
++            val on = request(true)
++            val following = io.submit { events += "new-mode" }
++            control.submit {}.get(5, TimeUnit.SECONDS)
++            assertFalse(enabled.get())
++            assertFalse(off.isDone); assertFalse(on.isDone)
++            assertEquals(listOf("enabled=false"), events.toList())
++            release.countDown()
++            assertTrue(result(off)); assertTrue(result(on)); following.get(5, TimeUnit.SECONDS)
++            assertEquals(listOf("enabled=false", "old-mode", "cleanup", "enabled=true", "new-mode"), events.toList())
++        } finally { release.countDown() }
++    }
++
++    @Test fun anEarlierQueuedOnCannotUndoALaterOff() {
++        val entered = CountDownLatch(1); val release = CountDownLatch(1)
++        io.execute { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
++        try {
++            assertTrue(entered.await(5, TimeUnit.SECONDS))
++            val on = request(true, prepare = { error("superseded enable must not prepare") })
++            val off = request(false)
++            control.submit {}.get(5, TimeUnit.SECONDS)
++            assertFalse(enabled.get())
++            release.countDown()
++            assertTrue(result(on)); assertTrue(result(off)); assertFalse(enabled.get())
++            assertEquals(listOf("enabled=false", "cleanup"), events.toList())
++        } finally { release.countDown() }
++    }
++
++    @Test fun anOffDuringEnablePreparationDoesNotWaitForItOrReviveAfterIt() {
++        val entered = CountDownLatch(1); val release = CountDownLatch(1)
++        try {
++            val on = request(true, prepare = { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)); true })
++            assertTrue(entered.await(5, TimeUnit.SECONDS))
++            val off = request(false)
++            control.submit {}.get(5, TimeUnit.SECONDS)
++            assertFalse(enabled.get())
++            release.countDown()
++            assertTrue(result(on)); assertTrue(result(off)); assertFalse(enabled.get())
++            assertEquals(listOf("enabled=false", "cleanup"), events.toList())
++        } finally { release.countDown() }
++    }
++
++    @Test fun anOffAfterEnableEnteredControlIsStillTheLastRealChange() {
++        val entered = CountDownLatch(1); val release = CountDownLatch(1)
++        val on = CompletableFuture<Result<Boolean>>()
++        try {
++            dispatch.dispatch(true, io, { true }, {
++                entered.countDown(); check(release.await(5, TimeUnit.SECONDS))
++                enabled.set(it); events += "enabled=$it"; true
++            }, { error("on has no off cleanup") }, { on.complete(it) })
++            assertTrue(entered.await(5, TimeUnit.SECONDS))
++            val off = request(false)
++            assertFalse(off.isDone)
++            release.countDown()
++            assertTrue(result(on)); assertTrue(result(off)); assertFalse(enabled.get())
++            assertEquals(listOf("enabled=true", "enabled=false", "cleanup"), events.toList())
++        } finally { release.countDown() }
++    }
++
++    @Test fun replacementPluginEnableWaitsForTheOriginalPluginsCleanup() {
++        val entered = CountDownLatch(1); val release = CountDownLatch(1)
++        try {
++            val off = request(false, cleanup = {
++                entered.countDown(); check(release.await(5, TimeUnit.SECONDS)); events += "cleanup"; true
++            })
++            assertTrue(entered.await(5, TimeUnit.SECONDS))
++            val on = request(true, lane = nextIo)
++            control.submit {}.get(5, TimeUnit.SECONDS)
++            assertFalse(enabled.get()); assertFalse(on.isDone)
++            release.countDown()
++            assertTrue(result(off)); assertTrue(result(on))
++            assertEquals(listOf("enabled=false", "cleanup", "enabled=true"), events.toList())
++        } finally { release.countDown() }
++    }
++
++    @Test fun falseAndThrowingCleanupRemainVisibleAndReleaseTheNextTicket() {
++        assertFalse(result(request(false, cleanup = { false })))
++        val failure = IllegalStateException("cleanup failed")
++        val failed = request(false, cleanup = { throw failure })
++        val on = request(true, lane = nextIo)
++        assertSame(failure, failed.get(5, TimeUnit.SECONDS).exceptionOrNull())
++        assertTrue(result(on)); assertTrue(enabled.get())
++    }
++
++    @Test fun aFailedChangeSkipsCleanupAndAThrowingCompletionCannotStrandSuccessors() {
++        val failure = IllegalStateException("change failed")
++        val failed = CompletableFuture<Result<Boolean>>()
++        val completion = CountDownLatch(1)
++        dispatch.dispatch(false, io, { true }, { throw failure }, { error("no cleanup after failed change") }, {
++            failed.complete(it); completion.countDown(); throw IllegalStateException("callback failed")
++        })
++        assertTrue(completion.await(5, TimeUnit.SECONDS))
++        val on = request(true, lane = nextIo)
++        assertSame(failure, failed.get(5, TimeUnit.SECONDS).exceptionOrNull())
++        assertTrue(result(on))
++    }
++
++    @Test fun aRejectedPreparationDoesNotPublishEnable() {
++        enabled.set(false)
++        assertFalse(result(request(true, prepare = { false })))
++        assertFalse(enabled.get()); assertTrue(events.isEmpty())
++    }
++}
+diff --git a/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneTaskSessionsTest.kt b/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneTaskSessionsTest.kt
+--- a/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneTaskSessionsTest.kt
++++ b/app/android/app/src/test/kotlin/io/github/ccch1mneyyy/dsh_app/phone/PhoneTaskSessionsTest.kt
+@@ -1,5 +1,7 @@
+ package io.github.ccch1mneyyy.dsh_app.phone
+ 
++import io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundDisplayIo
++import io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundTaskSlot
+ import io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundResourceJournal
+ import io.github.ccch1mneyyy.dsh_app.phone.skills.PhoneSkillReplaySelections
+ import io.github.ccch1mneyyy.dsh_app.phone.skills.PhoneSkillRoute
+@@ -7,6 +9,7 @@
+ import io.github.ccch1mneyyy.dsh_app.phone.skills.PhoneSkillOutcomes
+ import io.github.ccch1mneyyy.dsh_app.runtime.PhoneSkillBundleReader
+ import java.time.ZoneId
++import java.util.concurrent.CompletableFuture
+ import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.Executors
+ import java.util.concurrent.TimeUnit
+@@ -44,8 +47,10 @@
+     @Volatile private var cancelScope: (PhoneTaskSessions.Task, PhoneTasks.Snapshot) -> Unit = { task, state ->
+         if (state.stopped) task.activeWorker?.interruptCurrent(task.tasks)
+     }
++    @Volatile private var enabled = true
++    @Volatile private var ownedDriver: ((PhoneScreen, PhoneTasks.Owner) -> PhoneDriver?)? = null
+     private val env = object : PhoneEnv {
+-        override fun enabled() = true
++        override fun enabled() = this@PhoneTaskSessionsTest.enabled
+         override fun policies() = PhonePolicies()
+         override fun isLocked() = false
+         override fun gate() = object : UserGate {
+@@ -63,6 +68,10 @@
+             override fun perform(action: PhoneAction): ActionResult { actions.incrementAndGet(); return ActionResult(true, "done") }
+             override fun open(target: PhoneAppIdentity): ActionResult =
+                 this@PhoneTaskSessionsTest.open(target).also { if (it.ok) lastOpenedDriver = this }
++        }
++        override fun driver(screen: PhoneScreen, owner: PhoneTasks.Owner): PhoneDriver? {
++            val factory = ownedDriver ?: return driver(screen)
++            return factory(screen, owner)
+         }
+         override fun existingReplayDriver(owner: PhoneTasks.Owner, app: PhoneAppIdentity): PhoneDriver? = existingReplay(owner, app)
+         override fun a11yState() = A11yState.CONNECTED
+@@ -101,6 +110,89 @@
+     @After fun close() { pool.shutdownNow(); worker.shutdown(); backgroundWorkers.toList().forEach { it.shutdown() } }
+ 
+     private fun journalCount(): Int = journalBytes?.let { ((Json.parse(it) as Map<*, *>)["records"] as List<*>).size } ?: 0
++
++    @Test fun offOnAndEngineRestartCannotAdmitANewDriverAheadOfOldOffCleanup() {
++        val control = Executors.newSingleThreadExecutor()
++        val oldIo = Executors.newSingleThreadExecutor()
++        val newIo = Executors.newSingleThreadExecutor()
++        val switches = PhoneSwitchDispatch(control)
++        val slot = BackgroundTaskSlot<BackgroundDisplayIo<Any>, Any>(Any())
++        val peer = Any()
++        val observations = AtomicLong()
++        val cleanups = AtomicLong()
++        val modeEntered = CountDownLatch(1); val modeFinished = CountDownLatch(1)
++        val disabled = CountDownLatch(1)
++        ownedDriver = { screen, owner ->
++            val tasks = checkNotNull(sessions.task(owner.taskId)).tasks
++            val original = checkNotNull(slot.acquire(owner, peer, 1, { tasks.isCurrent(owner) }) { BackgroundDisplayIo() })
++            object : PhoneDriver by env.driver(screen) {
++                override fun observe(detail: Boolean, image: Boolean): ScreenSnapshot = original.driver.call {
++                    if (original.driver.peer() == null) {
++                        original.driver.startResource(peer, { beforeSend -> beforeSend(); true }) { it }
++                    } else original.driver.checkDispatch()
++                    observations.incrementAndGet()
++                    ScreenSnapshot("b1", "screen", "Example", "example.app")
++                }
++            }
++        }
++        fun change(on: Boolean): Boolean {
++            enabled = on
++            if (!on) {
++                sessions.stopAll("switch off")
++                slot.seal().forEach { it.driver.seal() }
++                sessions.retire()
++                disabled.countDown()
++            }
++            return true
++        }
++        fun cleanupOff(): Boolean {
++            cleanups.incrementAndGet()
++            return slot.seal().all { record -> record.driver.release { it === peer } && slot.complete(record) }
++        }
++        try {
++            sessions.beginCallerLaunch()
++            assertFalse(screen("old", background = true).isError)
++            val oldOwner = checkNotNull(task("old").tasks.activeOwner())
++            val original = checkNotNull(slot.find(oldOwner))
++            val preparations = backgroundPreparations.get()
++            oldIo.execute { modeEntered.countDown(); check(modeFinished.await(5, TimeUnit.SECONDS)) }
++            assertTrue(modeEntered.await(5, TimeUnit.SECONDS))
++            val off = CompletableFuture<Result<Boolean>>()
++            val on = CompletableFuture<Result<Boolean>>()
++            switches.dispatch(false, oldIo, { true }, ::change, ::cleanupOff, { off.complete(it) })
++            switches.dispatch(true, newIo, { true }, ::change, ::cleanupOff, { on.complete(it) })
++            assertTrue(disabled.await(5, TimeUnit.SECONDS))
++            // These are the real registry boundaries used by stopBridge/prepareLaunch.
++            sessions.retire()
++            sessions.beginCallerLaunch()
++            assertFalse(enabled)
++            assertTrue(original.driver.previewClosed())
++            assertFalse(slot.current(original))
++            assertTrue(screen("new-while-cleaning", background = true).isError)
++            assertEquals(preparations, backgroundPreparations.get())
++            assertEquals(1L, observations.get())
++            assertFalse(on.isDone)
++            modeFinished.countDown()
++            assertTrue(off.get(5, TimeUnit.SECONDS).getOrThrow())
++            assertTrue(on.get(5, TimeUnit.SECONDS).getOrThrow())
++            assertEquals(1L, cleanups.get())
++            assertFalse(slot.occupied)
++            sessions.retire()
++            sessions.beginCallerLaunch()
++            assertFalse(screen("new-after-cleanup", background = true).isError)
++            val successor = checkNotNull(slot.find(checkNotNull(task("new-after-cleanup").tasks.activeOwner())))
++            assertNotSame(original.driver, successor.driver)
++            assertTrue(slot.current(successor))
++            assertFalse(successor.driver.previewClosed())
++            assertEquals(2L, observations.get())
++            assertEquals(1L, cleanups.get())
++        } finally {
++            modeFinished.countDown()
++            control.shutdownNow(); oldIo.shutdownNow(); newIo.shutdownNow()
++            sessions.retire()
++            slot.seal().forEach { record -> record.driver.release { true }; slot.complete(record) }
++        }
++    }
+ 
+     @Test fun callerCapabilitySurvivesRetirementAndOnlyANewLaunchResetsIt() {
+         sessions.beginCallerLaunch()

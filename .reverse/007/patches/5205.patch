@@ -1,0 +1,66 @@
+diff --git a/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt b/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt
+--- a/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt
++++ b/runtime/tests/direct/cleanup-probe/CleanupObservationProbe.kt
+@@ -32,6 +32,7 @@
+             val runtime = DshProcess(Context(root), RuntimeManifest(), root, object : DshProcess.Listener {
+                 override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+                 override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
++                override fun onStartupFailure(source: DshProcess) {}
+                 override fun onExit(source: DshProcess, code: Int, expected: Boolean) {}
+             })
+             val clean = runtime.killStrays()
+diff --git a/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt b/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProcessCaptureProbe.kt
+@@ -38,6 +38,7 @@
+     )), root, object : DshProcess.Listener {
+         override fun onLog(line: String, stream: String, storageLine: String) { println("[$case] $line") }
+         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
++        override fun onStartupFailure(source: DshProcess) {}
+         override fun onExit(source: DshProcess, code: Int, expected: Boolean) {}
+     }).also(attempts::add)
+     val guestRecord = DshProcess::class.java.getDeclaredMethod("guestRecord").apply { isAccessible = true }
+diff --git a/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt b/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProcessRetryProbe.kt
+@@ -46,6 +46,7 @@
+         )), root, object : DshProcess.Listener {
+             override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+             override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
++            override fun onStartupFailure(source: DshProcess) {}
+             override fun onExit(source: DshProcess, code: Int, expected: Boolean) {
+                 exits += code
+                 done.countDown()
+diff --git a/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt b/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProcessScopeProbe.kt
+@@ -42,6 +42,7 @@
+         )), directory, object : DshProcess.Listener {
+             override fun onLog(line: String, stream: String, storageLine: String) { println("[$case] $line") }
+             override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
++            override fun onStartupFailure(source: DshProcess) {}
+             override fun onExit(source: DshProcess, code: Int, expected: Boolean) { done.countDown() }
+         })
+         attempts += process
+diff --git a/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt b/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt
+--- a/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt
++++ b/runtime/tests/direct/startup-probe/ProotTempCleanupProbe.kt
+@@ -50,6 +50,7 @@
+     val runtime = DshProcess(context, RuntimeManifest(launchArgv = listOf(launcher.path)), root, object : DshProcess.Listener {
+         override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
++        override fun onStartupFailure(source: DshProcess) {}
+         override fun onExit(source: DshProcess, code: Int, expected: Boolean) { check(code == 0); done.countDown() }
+     })
+     try {
+diff --git a/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt b/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt
+--- a/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt
++++ b/runtime/tests/direct/startup-probe/StartupPolicyProbe.kt
+@@ -58,6 +58,7 @@
+     )), root, object : DshProcess.Listener {
+         override fun onLog(line: String, stream: String, storageLine: String) { logs += line }
+         override fun onReady(source: DshProcess, baseUrl: String, token: String) {}
++        override fun onStartupFailure(source: DshProcess) {}
+         override fun onExit(source: DshProcess, code: Int, expected: Boolean) { exits += code; done.countDown() }
+     })
+     try {

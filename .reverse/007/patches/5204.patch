@@ -1,0 +1,208 @@
+diff --git a/runtime/lib/input_store.py b/runtime/lib/input_store.py
+--- a/runtime/lib/input_store.py
++++ b/runtime/lib/input_store.py
+@@ -16,6 +16,9 @@
+ import urllib.request
+ 
+ 
++MAX_UNKNOWN_BYTES = 1024 * 1024 * 1024
++
++
+ class InputError(Exception):
+     pass
+ 
+@@ -25,7 +28,7 @@
+ 
+ 
+ def shell_inputs(repo):
+-    source = (repo / "runtime/build-runtime.sh").read_text()
++    source = (repo / "runtime/build-runtime.sh").read_text(encoding="utf-8")
+     values = {}
+     for name, value in re.findall(r'^([A-Z][A-Z0-9_]*)="([^"\n]*)"', source, re.M):
+         default = re.fullmatch(r"\$\{" + name + r":-(.*)\}", value)
+@@ -69,7 +72,7 @@
+ 
+ 
+ def add_npm_lock(objects, lock, repo):
+-    data = json.loads(lock.read_text())
++    data = json.loads(lock.read_text(encoding="utf-8"))
+     for package_path, package in data["packages"].items():
+         if not package_path:
+             continue
+@@ -128,7 +131,7 @@
+             pinned(name, [values["TERMUX_REPO"] + "/pool/main/" + pool + "/" + package + "/" + name], abi, "termux_jni")
+         lock = repo / ("runtime/locks/ubuntu-noble-" + ubuntu + ".json")
+         mirror = values["UBUNTU_ARCHIVE_" + ("AMD64" if ubuntu == "amd64" else "ARM64")]
+-        for index, package in enumerate(json.loads(lock.read_text())["packages"]):
++        for index, package in enumerate(json.loads(lock.read_text(encoding="utf-8"))["packages"]):
+             name = Path(package["filename"]).name
+             urls = [mirror + "/" + package["filename"]]
+             if "UBUNTU_DEB_FALLBACK" in values:
+@@ -149,7 +152,7 @@
+     else:
+         defaults = [repo / ("runtime/locks/" + name + "/package-lock.json") for name in
+                     ("dsh-" + values["DSH_VERSION"], "pnpm-" + values["PNPM_VERSION"])]
+-        pnpm = json.loads(defaults[1].read_text())["packages"].get("node_modules/pnpm", {})
++        pnpm = json.loads(defaults[1].read_text(encoding="utf-8"))["packages"].get("node_modules/pnpm", {})
+         if pnpm.get("version") != values["PNPM_VERSION"] or pnpm.get("integrity") != values["PNPM_INTEGRITY"]:
+             raise InputError("current pnpm lock version/integrity does not match source pins")
+         locks = sorted(set(defaults) | set((repo / "runtime/locks").glob("*/package-lock.json"))) if all_locks else defaults
+@@ -179,16 +182,20 @@
+             temporary = Path(output.name)
+             digest = hashlib.new(obj["algorithm"])
+             size = 0
++            limit = obj["size"] if obj["size"] is not None else MAX_UNKNOWN_BYTES
+             while True:
+                 try:
+-                    chunk = source.read(1024 * 1024)
++                    chunk = source.read(min(1024 * 1024, limit - size + 1))
+                 except (OSError, http.client.HTTPException) as error:
+                     raise TransportError("input read failed: " + type(error).__name__) from error
+                 if not chunk:
+                     break
++                size += len(chunk)
++                if size > limit:
++                    reason = "size exceeds expected bytes" if obj["size"] is not None else "input exceeds transfer limit"
++                    raise InputError(reason + ": " + obj["key"])
+                 output.write(chunk)
+                 digest.update(chunk)
+-                size += len(chunk)
+             if digest.hexdigest() != obj["digest"]:
+                 raise InputError("checksum mismatch: " + obj["key"])
+             if obj["size"] is not None and size != obj["size"]:
+diff --git a/runtime/tests/test_input_store.py b/runtime/tests/test_input_store.py
+--- a/runtime/tests/test_input_store.py
++++ b/runtime/tests/test_input_store.py
+@@ -59,10 +59,10 @@
+     def test_inventory_reads_changed_pin_and_selected_lock(self):
+         repo = self.root / "repo"
+         (repo / "runtime").mkdir(parents=True)
+-        shell = (REPO / "runtime/build-runtime.sh").read_text()
++        shell = (REPO / "runtime/build-runtime.sh").read_text(encoding="utf-8")
+         _, pins = store.shell_inputs(REPO)
+         old = pins["proot-v5.1.107.98.zip"]
+-        (repo / "runtime/build-runtime.sh").write_text(shell.replace(old, "f" * 64))
++        (repo / "runtime/build-runtime.sh").write_text(shell.replace(old, "f" * 64), encoding="utf-8")
+         shutil.copytree(REPO / "runtime/locks", repo / "runtime/locks")
+         lock = repo / "runtime/locks/pnpm-11.28.5/package-lock.json"
+         selected = store.inventory(repo, [lock])
+@@ -81,32 +81,32 @@
+         repo = self.root / "repo"
+         (repo / "runtime").mkdir(parents=True)
+         shutil.copytree(REPO / "runtime/locks", repo / "runtime/locks")
+-        shell = (REPO / "runtime/build-runtime.sh").read_text()
++        shell = (REPO / "runtime/build-runtime.sh").read_text(encoding="utf-8")
+         for extra, message in (("  [new-fixed-input.tar.gz]=" + "0" * 64, "uncovered"),
+                                ("  [new-fixed-input.tar.gz]=${SOURCE_HASH}", "unparsed")):
+             with self.subTest(message=message):
+                 source = shell.replace("declare -A PIN=(\n", "declare -A PIN=(\n" + extra + "\n")
+-                (repo / "runtime/build-runtime.sh").write_text(source)
++                (repo / "runtime/build-runtime.sh").write_text(source, encoding="utf-8")
+                 with self.assertRaisesRegex(store.InputError, message):
+                     store.inventory(repo)
+ 
+     def test_current_pnpm_pin_and_lock_must_agree(self):
+         repo = self.root / "repo"
+-        shell = (REPO / "runtime/build-runtime.sh").read_text()
++        shell = (REPO / "runtime/build-runtime.sh").read_text(encoding="utf-8")
+         source = self.file("repo/runtime/build-runtime.sh", shell.encode())
+         shutil.copytree(REPO / "runtime/locks", repo / "runtime/locks")
+         values, _ = store.shell_inputs(repo)
+         lock = repo / ("runtime/locks/pnpm-" + values["PNPM_VERSION"] + "/package-lock.json")
+         replacement = "sha512-" + base64.b64encode(hashlib.sha512(b"changed source pin").digest()).decode()
+-        source.write_text(shell.replace(values["PNPM_INTEGRITY"], replacement))
++        source.write_text(shell.replace(values["PNPM_INTEGRITY"], replacement), encoding="utf-8")
+         for all_locks in (False, True):
+             with self.subTest(change="source integrity", all_locks=all_locks):
+                 with self.assertRaisesRegex(store.InputError, "pnpm.*pins"):
+                     store.inventory(repo, all_locks=all_locks)
+-        source.write_text(shell)
+-        data = json.loads(lock.read_text())
++        source.write_text(shell, encoding="utf-8")
++        data = json.loads(lock.read_text(encoding="utf-8"))
+         data["packages"]["node_modules/pnpm"]["version"] = "0.0.0-fixture"
+-        lock.write_text(json.dumps(data))
++        lock.write_text(json.dumps(data), encoding="utf-8")
+         for all_locks in (False, True):
+             with self.subTest(change="lock version", all_locks=all_locks):
+                 with self.assertRaisesRegex(store.InputError, "pnpm.*pins"):
+@@ -241,6 +241,50 @@
+                     with self.assertRaises((store.InputError, OSError)):
+                         store.store_stream(io.BytesIO(b"data"), obj, self.cas)
+                 self.assertEqual(replace.call_count, int(fail_replace))
++                self.assertFalse(list(self.cas.iterdir()))
++
++    def test_stream_limit_stops_after_one_extra_byte_and_keeps_existing_object(self):
++        class ShortRead(io.BytesIO):
++            def read(self, count):
++                return super().read(min(count, 3))
++
++        for expected_size in (0, 4, None):
++            with self.subTest(expected_size=expected_size):
++                limit = expected_size if expected_size is not None else 8
++                obj = original(b"a" * limit, size=expected_size)
++                destination = self.file("store/" + obj["key"], b"existing object")
++                source = ShortRead(b"a" * limit + b"extra data remains unread")
++                reason = "size exceeds expected bytes" if expected_size is not None else "transfer limit"
++                with patch.object(store, "MAX_UNKNOWN_BYTES", 8, create=True):
++                    with self.assertRaisesRegex(store.InputError, reason):
++                        store.store_stream(source, obj, self.cas)
++                self.assertEqual(source.tell(), limit + 1)
++                self.assertEqual(destination.read_bytes(), b"existing object")
++                self.assertFalse(list(self.cas.glob(".part-*")))
++
++    def test_exact_size_and_unknown_limit_allow_complete_verified_objects(self):
++        for expected_size, length in ((0, 0), (4, 4), (9, 9), (None, 0), (None, 8)):
++            with self.subTest(expected_size=expected_size, length=length):
++                payload = b"a" * length
++                obj = original(payload, size=expected_size)
++                with patch.object(store, "MAX_UNKNOWN_BYTES", 8, create=True):
++                    destination = store.store_stream(io.BytesIO(payload), obj, self.cas)
++                self.assertEqual(destination.read_bytes(), payload)
++                self.assertFalse(list(self.cas.glob(".part-*")))
++
++    def test_size_limit_stops_collection_without_mirror_or_later_object(self):
++        for expected_size in (4, None):
++            with self.subTest(expected_size=expected_size):
++                limit = expected_size if expected_size is not None else 8
++                obj = original(b"a" * limit, ["https://example.invalid/original"], size=expected_size)
++                later = original(b"next", ["https://example.invalid/next"])
++                with patch.object(store, "MAX_UNKNOWN_BYTES", 8, create=True), \
++                        patch.object(store.urllib.request, "urlopen", return_value=io.BytesIO(b"a" * (limit + 10))) as opener:
++                    result = store.collect_objects([obj, later], self.cas, "https://example.invalid/mirror")
++                self.assertEqual(opener.call_count, 1)
++                self.assertTrue(result["stopped"])
++                self.assertEqual(result["collected"], 0)
++                self.assertEqual(len(result["errors"]), 1)
+                 self.assertFalse(list(self.cas.iterdir()))
+ 
+     def test_import_identifies_bytes_not_names_and_verify_reports_all_errors(self):
+@@ -389,7 +433,7 @@
+         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+         self.assertEqual(lock.read_bytes(), before)
+         for name in dependencies:
+-            self.assertEqual((project / "node_modules" / name / "payload.txt").read_text(), "local payload: " + name)
++            self.assertEqual((project / "node_modules" / name / "payload.txt").read_text(encoding="utf-8"), "local payload: " + name)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/docs/design/runtime-input-store.md b/docs/design/runtime-input-store.md
+--- a/docs/design/runtime-input-store.md
++++ b/docs/design/runtime-input-store.md
+@@ -1,6 +1,6 @@
+ # 固定运行时输入原件库
+ 
+-`runtime/lib/input_store.py` 保留构建所需的原始归档字节，使用原有 SHA256 / npm SRI 寻址。它读取 `runtime/build-runtime.sh` 的版本默认值、`PIN` 和源地址，以及 Ubuntu / npm 锁；不执行 shell，不另维护一份 pin，不发布到外部。
++`runtime/lib/input_store.py` 保留构建所需的原始归档字节，使用原有 SHA256 / npm SRI 寻址。它以 UTF-8 读取 `runtime/build-runtime.sh` 的版本默认值、`PIN` 和源地址，以及 Ubuntu / npm 锁；不执行 shell，不另维护一份 pin，不发布到外部。
+ 
+ 这是 Linux 构建主机工具，要求 Python 3.11 或更新版本。npm 预热另需已有的 host Node/npm；脚本不安装系统工具。原件库必须支持同盘硬链接，批次临时目录建在库内。这里的文件同步和原子替换保证正常错误路径不发布半文件，不宣称完整的断电持久性。
+ 
+@@ -40,6 +40,8 @@
+ 
+ 下载先写库内临时文件；逐块计算原摘要、核对锁中已知大小，成功后 `fsync` 文件并 `os.replace` 到最终对象名。建立响应时的 HTTP 协议异常和读取中的传输中断均可继续下一来源；内容摘要/大小不符、坏的已存对象、写盘或替换失败立即停止本轮收集，不用下一来源掩盖错误。不可达对象会汇总报告，其他独立对象可继续收集。正常异常路径清理临时文件；进程被强杀可能留下 `.part-*`，它不被当作完整对象。
+ 
++新写对象的流式读取有字节上限：锁中大小已知时以该值为限；未知时以 1 GiB（1,073,741,824 字节）为限，这是工具的传输边界，不是已测量的原件大小。最多多读一个字节即可判定超限，超出的块不写盘，临时文件清理，既有对象不替换；超限是内容错误，不回落其他来源。相同限制也用于 `import` 的新对象写入，已有对象的摘要复核不变。
++
+ 所有子命令的 stdout 是一个 JSON 结果；错误时退出非零。`collect` 输出对象总数、缓存/新取数量、已取得字节数及错误；`verify` 输出逐项缺失/损坏。总字节是本轮实际核验对象的统计，不能据此宣称尚未收齐的全库大小。标准错误保留 npm 等诊断。
+ 
+ ## npm 预热与原锁离线安装

@@ -1,0 +1,96 @@
+# TEMPORARY verification workflow for reverse request 007. Never merge.
+# Runs only on pushes to the temporary branch. Compares the old startup/cleanup
+# probes on two clean trees (A: base + 5205, B: base + 5205 + 5206) and prints
+# every result with an `R007:` prefix. The full CI is triggered separately.
+name: reverse-007
+
+on:
+  push:
+    branches: [reverse/refactor2-007]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probes:
+    name: reverse-007 probe arms
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: R007 tools
+        run: |
+          echo "R007: ENV head=$(git rev-parse HEAD) runner=$(. /etc/os-release && echo "$PRETTY_NAME") arch=$(uname -m) uid=$(id -u) python=$(python3 --version 2>&1)"
+          command -v kotlinc java || true
+          java -version 2>&1 | sed 's/^/R007: java /'
+          kotlinc -version 2>&1 | head -n 2 | sed 's/^/R007: kotlinc /' || true
+      - name: R007 probe arms
+        run: |
+          BASE=1a2af92b7cfbd5958173f57949d26f2dd8e060e8
+          if ! command -v kotlinc >/dev/null || ! command -v java >/dev/null; then
+            echo "R007: PROBES not run: kotlinc=$(command -v kotlinc || echo missing) java=$(command -v java || echo missing)"
+            exit 0
+          fi
+          PATCHES="$PWD/.reverse/007/patches"
+          ROOT="$RUNNER_TEMP/r007"
+          mkdir -p "$ROOT"; chmod 700 "$ROOT"
+
+          run_arm() { # name, patches...
+            local arm="$1"; shift
+            local tree="$ROOT/tree-$arm" out="$ROOT/out-$arm"
+            git worktree add --detach "$tree" "$BASE" >/dev/null 2>&1 || { echo "R007: $arm worktree failed"; return; }
+            for p in "$@"; do
+              git -C "$tree" apply --check "$PATCHES/$p.patch"; c=$?
+              git -C "$tree" apply "$PATCHES/$p.patch"; a=$?
+              echo "R007: $arm apply $p check=$c apply=$a"
+            done
+            echo "R007: $arm tree-status: $(git -C "$tree" status --short | wc -l) changed paths; base=$(git -C "$tree" rev-parse HEAD)"
+            mkdir -m 700 "$out"
+            cd "$tree"
+            python3 runtime/tests/direct/startup-policy.py --output "$out/startup" > "$out/startup.stdout" 2> "$out/startup.stderr"; s=$?
+            echo "R007: $arm startup-policy exit=$s"
+            if [ -f "$out/startup/summary.json" ]; then echo "R007: $arm startup summary $(tr -d '\n ' < "$out/startup/summary.json")"; fi
+            python3 -I - "$out/startup" "$arm" <<'PY'
+          import json, os, sys
+          d, arm = sys.argv[1], sys.argv[2]
+          try:
+              recs = json.load(open(os.path.join(d, 'commands.json')))
+          except Exception as e:
+              print('R007: %s startup commands.json unreadable: %r' % (arm, e)); sys.exit()
+          ok = [r['case'] for r in recs if r['exit'] == 0]
+          bad = [r for r in recs if r['exit'] != 0]
+          print('R007: %s startup cases=%d pass=%d fail=%d' % (arm, len(recs), len(ok), len(bad)))
+          print('R007: %s startup pass-cases %s' % (arm, ','.join(ok)))
+          def head(path, n):
+              try:
+                  return open(path, errors='replace').read().splitlines()[:n]
+              except Exception as e:
+                  return ['<unreadable %r>' % (e,)]
+          for r in bad:
+              c = r['case']
+              print('R007: %s startup FAIL case=%s exit=%s' % (arm, c, r['exit']))
+              for l in head(os.path.join(d, c + '.stdout.log'), 6):
+                  print('R007: %s   [%s stdout] %s' % (arm, c, l[:400]))
+              for l in head(os.path.join(d, c + '.stderr.log'), 12):
+                  print('R007: %s   [%s stderr] %s' % (arm, c, l[:400]))
+          PY
+            bash runtime/tests/direct/compile-cleanup-probe.sh "$out/cleanup.jar" > "$out/compile.stdout" 2> "$out/compile.stderr"; k=$?
+            echo "R007: $arm compile-cleanup-probe exit=$k"
+            head -n 20 "$out/compile.stderr" | sed "s/^/R007: $arm compile stderr: /"
+            java -jar "$out/cleanup.jar" "$out/cleanup-roots" > "$out/cleanup.stdout" 2> "$out/cleanup.stderr"; j=$?
+            echo "R007: $arm cleanup-run exit=$j"
+            echo "R007: $arm cleanup passed-lines=$(grep -c '"pass":true' "$out/cleanup.stdout" || true) stdout-lines=$(wc -l < "$out/cleanup.stdout")"
+            sed "s/^/R007: $arm cleanup stdout: /" "$out/cleanup.stdout" | cut -c1-400 | head -n 40
+            head -n 14 "$out/cleanup.stderr" | cut -c1-400 | sed "s/^/R007: $arm cleanup stderr: /"
+            cd "$GITHUB_WORKSPACE"
+          }
+          run_arm A 5205
+          run_arm B 5205 5206
+          echo "R007: DONE"
